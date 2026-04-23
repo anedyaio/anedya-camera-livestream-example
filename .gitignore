@@ -1,0 +1,23 @@
+# Node
+peer/node_modules/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Local secrets/config
+.env
+.env.*
+!.env.example
+streamer/.env
+streamer/.env.*
+!streamer/.env.example
+
+# OS
+.DS_Store
+Thumbs.db
+recordings/
