@@ -1,6 +1,6 @@
 [<img src="https://img.shields.io/badge/Anedya-Documentation-blue?style=for-the-badge">](https://docs.anedya.io?utm_source=github&utm_medium=link&utm_campaign=github-examples&utm_content=pi-cam)
 
-# Pi Cam — CCTV Camera with Anedya + WebRTC
+# Pi Cam - CCTV Camera with Anedya + WebRTC
 
 <p align="center">
     <img src="https://cdn.anedya.io/anedya_black_banner.png" alt="Logo">
@@ -26,19 +26,6 @@ Turn a Raspberry Pi into a CCTV-style camera system using Anedya for signaling a
 
 WebRTC requires both peers to exchange SDP offers and answers before media can flow. This example uses Anedya ValueStore as a signaling channel and Anedya MQTT as the notification mechanism.
 
-<!-- TODO: Signaling sequence diagram
-     Draw a vertical sequence diagram with three columns: Peer App | Anedya Cloud | Pi Streamer
-     Arrows (left to right unless noted):
-       1. Peer → Anedya REST: fetch TURN credentials
-       2. Peer → Anedya ValueStore: write offer_<sessionId>
-       3. Anedya MQTT → Pi: notify value-store update
-       4. Pi → Anedya ValueStore: write answer_<sessionId>
-       5. Peer polls ValueStore → reads answer_<sessionId>
-       6. ICE negotiation (peer ↔ STUN/TURN ↔ Pi, bidirectional dashed arrows)
-       7. WebRTC media flows directly peer ↔ Pi (thick solid arrow)
-     Place this image below this comment block.
--->
-
 ```
 Peer App
   │  1. Fetch TURN credentials (Anedya REST API)
@@ -60,8 +47,6 @@ Peer App
     <img src="media/flow.png" alt="STUN direct connection diagram">
 </p>
 
-
-
 ### WebRTC Connectivity
 
 When both peers are on the same network, ICE resolves a direct path using STUN address discovery:
@@ -80,16 +65,8 @@ When a firewall blocks direct peer-to-peer traffic, Anedya's managed TURN relay 
 
 The Pi records continuously into 5-second MP4 segments on disk. The viewer receives a timeline over the WebRTC DataChannel and can seek into any finalized segment using the same data channel; the Pi reads and streams the file directly.
 
-<!-- TODO: DVR timeline diagram
-     Draw a horizontal timeline strip showing:
-       - A row of labeled boxes: seg_1.mp4 | seg_2.mp4 | seg_3.mp4 | ... | LIVE
-       - An arrow below labeled "scrubber offset (seconds from start)"
-       - A callout on one segment showing: "in-file offset = global_offset - segment.start_offset"
-       - A "LIVE" marker at the right end showing the scrubber snaps here in live mode
-     Place this image below this comment block.
--->
 <p align="center">
-    <img src="media/timeline.png" alt="TURN relay connection diagram">
+    <img src="media/playback.png" alt="TURN relay connection diagram">
 </p>
 
 ---
@@ -129,7 +106,7 @@ The Pi records continuously into 5-second MP4 segments on disk. The viewer recei
 **Software / Accounts**
 - Raspberry Pi OS or any Linux environment
 - Python 3.11+
-- [`uv`](https://docs.astral.sh/uv/guides/projects/) — Python package manager
+- [`uv`](https://docs.astral.sh/uv/guides/projects/) : Python package manager
 - An [Anedya](https://anedya.io?utm_source=github&utm_medium=link&utm_campaign=github-examples&utm_content=pi-cam) account
 
 ---
@@ -180,6 +157,12 @@ ANEDYA_DEVICE_ID=your-device-uuid
 ANEDYA_NODE_ID=your-node-uuid
 ANEDYA_CONNECTION_KEY=your-connection-key
 ANEDYA_REGION=ap-in-1
+```
+
+Install `uv` if not already present:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
 Install Python dependencies:
@@ -283,4 +266,4 @@ This project uses OpenCV `VideoCapture`.
 
 ## License
 
-This project is licensed under the [MIT License](LICENSE).
+This project is licensed under the [Apache License 2.0](LICENSE).
