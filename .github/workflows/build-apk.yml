@@ -3,7 +3,7 @@ name: Build APK
 on:
   push:
     branches:
-      - '**'
+      - main
 
 jobs:
   build:
@@ -31,17 +31,12 @@ jobs:
         working-directory: peer_app
         run: flutter build apk
 
-      - name: Sanitize branch name
-        id: branch
-        run: echo "name=$(echo '${{ github.ref_name }}' | tr '/' '-' | tr ' ' '-')" >> "$GITHUB_OUTPUT"
-
       - name: Upload APK to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: apk/${{ steps.branch.outputs.name }}
-          name: "APK — ${{ github.ref_name }}"
-          prerelease: ${{ github.ref_name != 'main' }}
+          tag_name: v${{ github.run_number }}
+          name: "Release v${{ github.run_number }}"
           body: |
-            Automated APK build from branch `${{ github.ref_name }}`.
+            Automated APK build from `main`.
             Commit: ${{ github.sha }}
           files: peer_app/build/app/outputs/flutter-apk/app-release.apk
