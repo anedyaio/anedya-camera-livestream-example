@@ -21,3 +21,38 @@ streamer/.env.*
 .DS_Store
 Thumbs.db
 recordings/
+
+# Flutter / Dart
+**/doc/api/
+**/ios/Flutter/.last_build_id
+.dart_tool/
+.pub-cache/
+.pub/
+peer_app/build/
+peer_app/coverage/
+peer_app/.flutter-plugins-dependencies
+
+# Dart / editor artifacts
+*.class
+*.log
+*.iml
+*.ipr
+*.iws
+.idea/
+app.*.symbols
+app.*.map.json
+
+# Android build artifacts
+peer_app/android/app/debug/
+peer_app/android/app/profile/
+peer_app/android/app/release/
+peer_app/android/.gradle/
+peer_app/android/captures/
+peer_app/android/local.properties
+peer_app/android/.cxx/
+peer_app/android/GeneratedPluginRegistrant.java
+
+# Android signing — never commit keystores or key.properties
+peer_app/android/key.properties
+**/*.keystore
+**/*.jks
