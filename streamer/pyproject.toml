@@ -1,0 +1,19 @@
+[project]
+name = "streamer"
+version = "0.1.0"
+description = "Pi camera WebRTC streamer with Anedya MQTT signaling and rolling local recording."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiortc",
+    "av",
+    "numpy",
+    "opencv-python",
+    "paho-mqtt",
+    "pygrabber>=0.2",
+    "qrcode",
+    "sounddevice",
+]
+
+[project.scripts]
+streamer = "main:cli"

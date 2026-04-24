@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Pi Cam</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background: #0a0a0a;
+      color: #eee;
+      font-family: system-ui, sans-serif;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      min-height: 100dvh;
+      padding: 1rem;
+      gap: 1rem;
+    }
+
+    h1 {
+      font-size: 1.2rem;
+      letter-spacing: 0.05em;
+      opacity: 0.7;
+    }
+
+    #status {
+      font-size: 0.85rem;
+      padding: 0.4rem 0.8rem;
+      border-radius: 999px;
+      background: #222;
+    }
+
+    #status.connected {
+      background: #14532d;
+      color: #4ade80;
+    }
+
+    #status.error {
+      background: #450a0a;
+      color: #f87171;
+    }
+
+    video {
+      width: 100%;
+      max-width: 640px;
+      height: auto;
+      background: #111;
+      border-radius: 0.75rem;
+      object-fit: contain;
+      display: block;
+    }
+
+    .btn-row {
+      display: flex;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+      justify-content: center;
+    }
+
+    .toolbar {
+      width: 100%;
+      max-width: 640px;
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    button {
+      padding: 0.75rem 2rem;
+      border: none;
+      border-radius: 0.5rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      color: white;
+      transition: background 0.2s;
+    }
+
+    button:disabled {
+      background: #333;
+      color: #666;
+      cursor: default;
+    }
+
+    #startBtn {
+      background: #2563eb;
+    }
+
+    #stopBtn {
+      background: #dc2626;
+    }
+
+    #liveBtn {
+      background: #059669;
+      display: none;
+    }
+
+    #settingsBtn,
+    #saveSettingsBtn {
+      background: #374151;
+    }
+
+    .toggle-row {
+      width: 100%;
+      max-width: 640px;
+      display: flex;
+      justify-content: center;
+    }
+
+    .toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      font-size: 0.9rem;
+      opacity: 0.9;
+    }
+
+    .toggle input {
+      width: 1rem;
+      height: 1rem;
+      accent-color: #2563eb;
+    }
+
+    #timeline-panel,
+    #settings-panel,
+    #log {
+      width: 100%;
+      max-width: 640px;
+    }
+
+    #timeline-panel,
+    #settings-panel {
+      display: none;
+      flex-direction: column;
+      gap: 0.5rem;
+      background: #151515;
+      border-radius: 0.75rem;
+      padding: 0.9rem;
+    }
+
+    #settings-panel {
+      gap: 0.85rem;
+    }
+
+    #settings-panel h2 {
+      font-size: 0.9rem;
+      opacity: 0.6;
+      letter-spacing: 0.05em;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 0.35rem;
+    }
+
+    .field label {
+      font-size: 0.82rem;
+      opacity: 0.75;
+    }
+
+    .field input {
+      width: 100%;
+      border: 1px solid #2d2d2d;
+      border-radius: 0.5rem;
+      background: #111;
+      color: #eee;
+      padding: 0.75rem 0.85rem;
+      font-size: 0.95rem;
+    }
+
+    #settings-note {
+      font-size: 0.75rem;
+      opacity: 0.55;
+      line-height: 1.5;
+    }
+
+    #timeline-meta {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.82rem;
+      opacity: 0.75;
+    }
+
+    #dvrSlider {
+      width: 100%;
+      accent-color: #2563eb;
+    }
+
+    #timeline-status {
+      font-size: 0.82rem;
+      opacity: 0.75;
+    }
+
+    #log {
+      font-size: 0.75rem;
+      opacity: 0.55;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>PI CAM</h1>
+  <div id="status">Connecting...</div>
+  <video id="video" autoplay playsinline></video>
+
+  <div class="toolbar">
+    <button id="settingsBtn" type="button">Settings</button>
+  </div>
+
+  <div class="btn-row">
+    <button id="startBtn" disabled>Start Stream</button>
+    <button id="stopBtn" disabled>Stop Stream</button>
+    <button id="liveBtn">Go Live</button>
+  </div>
+
+  <div class="toggle-row">
+    <label class="toggle">
+      <input id="relayOnlyToggle" type="checkbox" />
+      <span>Force relay/TURN only</span>
+    </label>
+  </div>
+
+  <div id="settings-panel">
+    <h2>SETTINGS</h2>
+    <div class="field">
+      <label for="nodeIdInput">Anedya Node ID</label>
+      <input id="nodeIdInput" type="text" placeholder="Node UUID" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="apiKeyInput">Anedya API Key</label>
+      <input id="apiKeyInput" type="password" placeholder="Bearer ..." autocomplete="off" />
+    </div>
+    <button id="saveSettingsBtn" type="button">Save Settings</button>
+    <div id="settings-note">Node ID and API key are stored in this browser via localStorage. Prefix key with <code>Bearer</code> if your token needs it.</div>
+  </div>
+
+  <div id="timeline-panel">
+    <div id="timeline-meta">
+      <span id="timelineCurrent">00:00</span>
+      <span id="timelineEnd">LIVE</span>
+    </div>
+    <input id="dvrSlider" type="range" min="0" max="0" step="0.1" value="0" disabled />
+    <div id="timeline-status">Recording starts immediately. Playback appears after first finalized segment.</div>
+  </div>
+
+  <pre id="log"></pre>
+
+  <script>
+    /*
+      Browser-side viewer.
+
+      Responsibilities:
+      1. Ask Anedya for TURN credentials.
+      2. Create WebRTC offer.
+      3. Write offer into Anedya value store.
+      4. Poll for device answer.
+      5. Use data channel for control messages.
+    */
+
+    // UI references.
+    const statusEl = document.getElementById('status');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    const liveBtn = document.getElementById('liveBtn');
+    const settingsBtn = document.getElementById('settingsBtn');
+    const relayOnlyToggle = document.getElementById('relayOnlyToggle');
+    const settingsPanel = document.getElementById('settings-panel');
+    const nodeIdInput = document.getElementById('nodeIdInput');
+    const apiKeyInput = document.getElementById('apiKeyInput');
+    const saveSettingsBtn = document.getElementById('saveSettingsBtn');
+    const video = document.getElementById('video');
+    const logEl = document.getElementById('log');
+    const timelinePanel = document.getElementById('timeline-panel');
+    const dvrSlider = document.getElementById('dvrSlider');
+    const timelineCurrent = document.getElementById('timelineCurrent');
+    const timelineEnd = document.getElementById('timelineEnd');
+    const timelineStatus = document.getElementById('timeline-status');
+
+    const ANEDYA_API_BASE = 'https://api.ap-in-1.anedya.io/v1';
+    const STORAGE_KEYS = {
+      nodeId: 'pi-cam.anedyaNodeId',
+      apiKey: 'pi-cam.anedyaApiKey',
+      relayOnly: 'pi-cam.relayOnly',
+    };
+
+    // Per-browser-session state.
+    let pc = null;
+    let dc = null;
+    let pollTimer = null;
+    let timelineTimer = null;
+    let draggingSlider = false;
+
+    function uiLog(msg) {
+      logEl.textContent += msg + '\n';
+    }
+
+    function getApiKey() {
+      return localStorage.getItem(STORAGE_KEYS.apiKey)?.trim() || '';
+    }
+
+    function getNodeId() {
+      return localStorage.getItem(STORAGE_KEYS.nodeId)?.trim() || '';
+    }
+
+    function getVsHeaders() {
+      const apiKey = getApiKey();
+      if (!apiKey) {
+        throw new Error('Missing API key');
+      }
+      return {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+        'Authorization': "Bearer " + apiKey,
+      };
+    }
+
+    function getVsNamespace() {
+      const nodeId = getNodeId();
+      if (!nodeId) {
+        throw new Error('Missing node ID');
+      }
+      return { scope: 'node', id: nodeId };
+    }
+
+    function relayOnlyEnabled() {
+      return relayOnlyToggle.checked;
+    }
+
+    function syncSettingsUI() {
+      nodeIdInput.value = localStorage.getItem(STORAGE_KEYS.nodeId) || '';
+      apiKeyInput.value = localStorage.getItem(STORAGE_KEYS.apiKey) || '';
+      relayOnlyToggle.checked = localStorage.getItem(STORAGE_KEYS.relayOnly) === 'true';
+    }
+
+    function formatTime(totalSeconds) {
+      const seconds = Math.max(0, Math.floor(totalSeconds));
+      const h = Math.floor(seconds / 3600);
+      const m = Math.floor((seconds % 3600) / 60);
+      const s = seconds % 60;
+      if (h > 0) return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+      return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
+
+    function resetUI() {
+      video.srcObject = null;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      liveBtn.style.display = 'none';
+      timelinePanel.style.display = 'none';
+      dvrSlider.disabled = true;
+      dvrSlider.value = 0;
+      dvrSlider.max = 0;
+      timelineCurrent.textContent = '00:00';
+      timelineEnd.textContent = 'LIVE';
+      timelineStatus.textContent = 'Recording starts immediately. Playback appears after first finalized segment.';
+      statusEl.textContent = 'Ready - press Start';
+      statusEl.className = 'connected';
+    }
+
+    function stopStream() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      if (timelineTimer) { clearInterval(timelineTimer); timelineTimer = null; }
+      if (pc) { pc.close(); pc = null; }
+      dc = null;
+      uiLog('Stream stopped');
+      resetUI();
+    }
+
+    function toggleSettingsPanel() {
+      settingsPanel.style.display = settingsPanel.style.display === 'flex' ? 'none' : 'flex';
+    }
+
+    function sendCmd(cmd) {
+      if (dc && dc.readyState === 'open') {
+        dc.send(JSON.stringify(cmd));
+      }
+    }
+
+    function renderTimeline(msg) {
+      timelinePanel.style.display = 'flex';
+
+      const duration = Number(msg.duration || 0);
+      const position = Number(msg.playback_offset ?? duration);
+
+      dvrSlider.disabled = duration <= 0;
+      dvrSlider.max = duration;
+      if (!draggingSlider) {
+        dvrSlider.value = Math.min(position, duration);
+      }
+
+      timelineCurrent.textContent = formatTime(Number(dvrSlider.value || 0));
+      timelineEnd.textContent = duration > 0 ? formatTime(duration) : 'LIVE';
+
+      if (duration <= 0) {
+        timelineStatus.textContent = 'Recording starts immediately. Playback appears after first finalized segment.';
+        liveBtn.style.display = 'none';
+        return;
+      }
+
+      if (msg.mode === 'live') {
+        timelineStatus.textContent = 'Live mode';
+        liveBtn.style.display = 'none';
+      } else {
+        const behindLive = Math.max(0, duration - position);
+        timelineStatus.textContent = `Playback mode - ${formatTime(behindLive)} behind live`;
+        liveBtn.style.display = 'inline-block';
+      }
+    }
+
+    // Data channel controls only the device-side playback mode.
+    liveBtn.addEventListener('click', () => {
+      sendCmd({ cmd: 'live' });
+      uiLog('Switched to live');
+    });
+
+    dvrSlider.addEventListener('input', () => {
+      draggingSlider = true;
+      timelineCurrent.textContent = formatTime(Number(dvrSlider.value || 0));
+    });
+
+    dvrSlider.addEventListener('change', () => {
+      draggingSlider = false;
+      const offset = Number(dvrSlider.value || 0);
+      sendCmd({ cmd: 'seek', offset });
+      uiLog(`Seeking to ${formatTime(offset)}`);
+    });
+
+    async function vsSet(key, value) {
+      const resp = await fetch(`${ANEDYA_API_BASE}/valuestore/setValue`, {
+        method: 'POST',
+        headers: getVsHeaders(),
+        body: JSON.stringify({ namespace: getVsNamespace(), key, value, type: 'string' }),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        throw new Error(`vsSet failed: ${resp.status} - ${text}`);
+      }
+    }
+
+    async function vsGet(key) {
+      const resp = await fetch(`${ANEDYA_API_BASE}/valuestore/getValue`, {
+        method: 'POST',
+        headers: getVsHeaders(),
+        body: JSON.stringify({ namespace: getVsNamespace(), key }),
+      });
+      if (!resp.ok) return null;
+      const json = await resp.json();
+      if (!json.value) return null;
+      return json.value;
+    }
+
+    async function fetchTurnCredentials() {
+      const resp = await fetch(`${ANEDYA_API_BASE}/relay/create`, {
+        method: 'POST',
+        headers: getVsHeaders(),
+        body: JSON.stringify({ relayType: 'turn' }),
+      });
+      if (!resp.ok) throw new Error(`TURN fetch failed: ${resp.status}`);
+      const json = await resp.json();
+      if (!json.relayData) throw new Error(json.error || 'no relayData');
+      return {
+        ...json.relayData,
+        password: json.relayData.credential,
+        relayExpiry: json.relayExpiry,
+      };
+    }
+
+    function buildIceConfig(relayData) {
+      /*
+        PeerConnection config for browser side.
+
+        Browser and device both use same TURN allocation details. This allows
+        connection through NAT even when direct P2P is not possible.
+      */
+      return {
+        iceTransportPolicy: relayOnlyEnabled() ? 'relay' : 'all',
+        iceServers: [{
+          urls: [
+            // TODO : Dont hardcode these - get from API
+            'stun:turn1.ap-in-1.anedya.io:3478',
+            'turn:turn1.ap-in-1.anedya.io:3478'
+          ],
+          username: relayData.username,
+          credential: relayData.password
+        }],
+      };
+    }
+
+    settingsBtn.addEventListener('click', toggleSettingsPanel);
+
+    saveSettingsBtn.addEventListener('click', () => {
+      const nodeId = nodeIdInput.value.trim();
+      const value = apiKeyInput.value.trim();
+      if (nodeId) {
+        localStorage.setItem(STORAGE_KEYS.nodeId, nodeId);
+      } else {
+        localStorage.removeItem(STORAGE_KEYS.nodeId);
+      }
+      if (value) {
+        localStorage.setItem(STORAGE_KEYS.apiKey, value);
+      } else {
+        localStorage.removeItem(STORAGE_KEYS.apiKey);
+      }
+      localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
+      uiLog(`Settings saved (${nodeId ? 'node set' : 'node missing'}, ${value ? 'key set' : 'key missing'}, relay ${relayOnlyToggle.checked ? 'forced' : 'auto'})`);
+      settingsPanel.style.display = 'none';
+    });
+
+    relayOnlyToggle.addEventListener('change', () => {
+      localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
+    });
+
+    startBtn.addEventListener('click', async () => {
+      if (!getNodeId()) {
+        uiLog('Missing node ID');
+        statusEl.textContent = 'Missing node ID';
+        statusEl.className = 'error';
+        settingsPanel.style.display = 'flex';
+        return;
+      }
+
+      if (!getApiKey()) {
+        uiLog('Missing API key');
+        statusEl.textContent = 'Missing API key';
+        statusEl.className = 'error';
+        settingsPanel.style.display = 'flex';
+        return;
+      }
+
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      statusEl.textContent = 'Fetching TURN credentials...';
+      statusEl.className = '';
+
+      // Step 1: browser asks Anedya for TURN credentials.
+      let relayData;
+      try {
+        relayData = await fetchTurnCredentials();
+        uiLog(`TURN ready (expires ${new Date(relayData.relayExpiry * 1000).toLocaleTimeString()})`);
+      } catch (err) {
+        uiLog('TURN error: ' + err.message);
+        statusEl.textContent = 'Error';
+        statusEl.className = 'error';
+        resetUI();
+        return;
+      }
+
+      // Step 2: browser creates peer connection and data channel.
+      pc = new RTCPeerConnection(buildIceConfig(relayData));
+      dc = pc.createDataChannel('control', { ordered: true });
+
+      dc.onopen = () => {
+        uiLog('DataChannel open - requesting timeline');
+        timelinePanel.style.display = 'flex';
+        sendCmd({ cmd: 'timeline' });
+
+        // Timeline is polled so browser UI updates while recording window grows.
+        timelineTimer = setInterval(() => sendCmd({ cmd: 'timeline' }), 2000);
+      };
+
+      dc.onmessage = (e) => {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'timeline') {
+          renderTimeline(msg);
+        } else if (msg.type === 'error') {
+          uiLog('Error: ' + msg.message);
+        }
+      };
+
+      // Browser receives media only. Device sends video/audio.
+      const videoTransceiver = pc.addTransceiver('video', { direction: 'recvonly' });
+      pc.addTransceiver('audio', { direction: 'recvonly' });
+
+      // Prefer H.264 when browser supports codec preference ordering.
+      if (RTCRtpReceiver.getCapabilities) {
+        const { codecs } = RTCRtpReceiver.getCapabilities('video');
+        const h264 = codecs.filter(c => c.mimeType === 'video/H264');
+        const rest = codecs.filter(c => c.mimeType !== 'video/H264');
+        if (h264.length) {
+          try {
+            videoTransceiver.setCodecPreferences([...h264, ...rest]);
+            uiLog('Codec: H.264 preferred');
+          } catch (e) {
+            uiLog('setCodecPreferences not supported - using browser default');
+          }
+        }
+      }
+
+      pc.ontrack = (e) => {
+        uiLog('Got remote track: ' + e.track.kind);
+        if (e.streams && e.streams[0]) {
+          video.srcObject = e.streams[0];
+          statusEl.textContent = 'Streaming';
+          statusEl.className = 'connected';
+        }
+      };
+
+      pc.onconnectionstatechange = async () => {
+        uiLog('PC state: ' + pc.connectionState);
+        if (pc.connectionState === 'connected') {
+          const stats = await pc.getStats();
+          stats.forEach(report => {
+            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+              const local = stats.get(report.localCandidateId);
+              const remote = stats.get(report.remoteCandidateId);
+              if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
+                uiLog('Candidate type: TURN');
+              } else {
+                uiLog('Candidate type: P2P');
+              }
+            }
+          });
+        } else if (pc.connectionState === 'failed') {
+          statusEl.textContent = 'Connection failed';
+          statusEl.className = 'error';
+          stopStream();
+        }
+      };
+
+      // Step 3: create offer and wait until all local ICE candidates are gathered.
+      statusEl.textContent = 'Gathering ICE...';
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+
+      // TODO
+      await new Promise(resolve => {
+        if (pc.iceGatheringState === 'complete') { resolve(); return; }
+        pc.onicegatheringstatechange = () => {
+          if (pc.iceGatheringState === 'complete') resolve();
+        };
+      });
+
+      // Step 4: write offer + TURN data into Anedya value store.
+      const sessionId = Math.random().toString(36).slice(2, 10);
+      const offerKey = `offer_${sessionId}`;
+      const answerKey = `answer_${sessionId}`;
+
+      try {
+        statusEl.textContent = 'Sending offer...';
+        const payload = JSON.stringify({
+          offer: { sdp: pc.localDescription.sdp, type: pc.localDescription.type },
+          turn: relayData
+        });
+        await vsSet(offerKey, payload);
+        uiLog(`Offer written (key=${offerKey}) - polling for answer...`);
+        statusEl.textContent = 'Waiting for Pi...';
+      } catch (err) {
+        uiLog('Error writing offer: ' + err.message);
+        statusEl.textContent = 'Error';
+        statusEl.className = 'error';
+        resetUI();
+        return;
+      }
+
+      // Step 5: poll for answer. Device writes answer into `answer_<sessionId>`.
+      let attempts = 0;
+      const MAX_ATTEMPTS = 30;
+      pollTimer = setInterval(async () => {
+        attempts++;
+        if (attempts > MAX_ATTEMPTS) {
+          clearInterval(pollTimer); pollTimer = null;
+          uiLog('Timeout: Pi did not respond in time');
+          statusEl.textContent = 'Timeout';
+          statusEl.className = 'error';
+          stopStream();
+          return;
+        }
+
+        try {
+          const value = await vsGet(answerKey);
+          if (value) {
+            clearInterval(pollTimer); pollTimer = null;
+            const answerSdp = JSON.parse(value);
+            await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
+            uiLog('Answer applied - WebRTC connecting...');
+          }
+        } catch (err) {
+          uiLog('Poll error: ' + err.message);
+        }
+      }, 2000);
+    });
+
+    stopBtn.addEventListener('click', stopStream);
+
+    statusEl.textContent = 'Ready - press Start';
+    statusEl.className = 'connected';
+    startBtn.disabled = false;
+    syncSettingsUI();
+  </script>
+</body>
+
+</html>
