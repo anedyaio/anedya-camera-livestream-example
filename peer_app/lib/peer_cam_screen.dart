@@ -9,11 +9,15 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'qr_code_scanner.dart';
 
-const String _kApiBase = 'https://api.ap-in-1.anedya.io/v1';
-const String _kPrefNodeId = 'peer_app.nodeId';
-const String _kPrefApiKey = 'peer_app.apiKey';
-const String _kPrefRelayOnly = 'peer_app.relayOnly';
+const String anedyaApiBase = 'https://api.ap-in-1.anedya.io/v1';
 
+// Keys used to persist settings on-device via SharedPreferences.
+const String prefKeyNodeId = 'peer_app.nodeId';
+const String prefKeyApiKey = 'peer_app.apiKey';
+const String prefKeyRelayOnly = 'peer_app.relayOnly';
+
+/// Main viewer screen. Manages the full WebRTC connection lifecycle:
+/// settings → TURN fetch → offer → poll answer → stream → playback.
 class PeerCamScreen extends StatefulWidget {
   const PeerCamScreen({super.key});
 
@@ -22,433 +26,522 @@ class PeerCamScreen extends StatefulWidget {
 }
 
 class _PeerCamScreenState extends State<PeerCamScreen> {
-  String _nodeId = '';
-  String _apiKey = '';
-  bool _relayOnly = false;
 
-  late TextEditingController _nodeIdCtrl;
-  late TextEditingController _apiKeyCtrl;
-  bool _showSettings = false;
+  String _nodeId = ''; // Anedya Node ID of the Pi camera device
+  String _apiKey = ''; // Anedya Platform API key
+  bool _forceRelayOnly = false; // when true, forces WebRTC to use TURN relay only
 
-  bool _isStreaming = false;
-  bool _hasError = false;
-  String _status = 'Ready - press Start';
-  String _logs = '';
+  late TextEditingController _nodeIdController;
+  late TextEditingController _apiKeyController;
+  bool _isSettingsPanelVisible = false;
 
-  final RTCVideoRenderer _renderer = RTCVideoRenderer();
-  RTCPeerConnection? _pc;
-  RTCDataChannel? _dc;
-  Timer? _pollTimer;
-  Timer? _timelineTimer;
-  bool _disposed = false;
+  // Stream / connection state
+  bool _isStreamActive = false;
+  bool _isInErrorState = false;
+  String _statusText = 'Ready - press Start';
+  String _logOutput = '';
 
-  double _sliderMax = 0.0;
-  double _sliderValue = 0.0;
-  bool _draggingSlider = false;
-  bool _showTimeline = false;
-  bool _showLiveBtn = false;
-  String _timelineStatus =
+  // WebRTC objects
+  final RTCVideoRenderer _videoRenderer = RTCVideoRenderer();
+  RTCPeerConnection? _peerConnection;
+  RTCDataChannel? _dataChannel; // ordered channel named "control"
+  Timer? _answerPollTimer; // polls ValueStore for the Pi's SDP answer
+  Timer? _timelinePollTimer; // requests timeline state from Pi every 2 s
+  bool _isDisposed = false;
+
+  // Timeline state
+  double _totalRecordedSeconds = 0.0; // total duration available for scrubbing
+  double _currentPositionSeconds = 0.0; // current playback position
+  bool _isUserScrubbing = false; // true while user drags the slider
+  bool _showTimelinePanel = false;
+  bool _showGoLiveButton = false;
+  String _timelineStatusText =
       'Recording starts immediately. Playback appears after first finalized segment.';
-  String _timelineCurrent = '00:00';
-  String _timelineEnd = 'LIVE';
+  String _currentTimeLabel = '00:00';
+  String _totalDurationLabel = 'LIVE';
 
   @override
   void initState() {
     super.initState();
-    _renderer.initialize();
-    _nodeIdCtrl = TextEditingController();
-    _apiKeyCtrl = TextEditingController();
-    _loadPrefs();
+    _videoRenderer.initialize();
+    _nodeIdController = TextEditingController();
+    _apiKeyController = TextEditingController();
+    _loadSavedSettings();
   }
 
-  Future<void> _loadPrefs() async {
+  /// Reads node ID, API key, and relay-only flag from device storage.
+  Future<void> _loadSavedSettings() async {
     final prefs = await SharedPreferences.getInstance();
-    _ss(() {
-      _nodeId = prefs.getString(_kPrefNodeId) ?? '';
-      _apiKey = prefs.getString(_kPrefApiKey) ?? '';
-      _relayOnly = prefs.getBool(_kPrefRelayOnly) ?? false;
-      _nodeIdCtrl.text = _nodeId;
-      _apiKeyCtrl.text = _apiKey;
+    _safeSetState(() {
+      _nodeId = prefs.getString(prefKeyNodeId) ?? '';
+      _apiKey = prefs.getString(prefKeyApiKey) ?? '';
+      _forceRelayOnly = prefs.getBool(prefKeyRelayOnly) ?? false;
+      _nodeIdController.text = _nodeId;
+      _apiKeyController.text = _apiKey;
     });
   }
 
-  Future<void> _savePrefs() async {
+  /// Persists current settings to device storage.
+  Future<void> _saveSettings() async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_kPrefNodeId, _nodeId);
-    await prefs.setString(_kPrefApiKey, _apiKey);
-    await prefs.setBool(_kPrefRelayOnly, _relayOnly);
+    await prefs.setString(prefKeyNodeId, _nodeId);
+    await prefs.setString(prefKeyApiKey, _apiKey);
+    await prefs.setBool(prefKeyRelayOnly, _forceRelayOnly);
   }
 
   @override
   void dispose() {
-    _disposed = true;
-    _pollTimer?.cancel();
-    _timelineTimer?.cancel();
-    _closePc();
-    _renderer.dispose();
-    _nodeIdCtrl.dispose();
-    _apiKeyCtrl.dispose();
+    _isDisposed = true;
+    _answerPollTimer?.cancel();
+    _timelinePollTimer?.cancel();
+    _closePeerConnection();
+    _videoRenderer.dispose();
+    _nodeIdController.dispose();
+    _apiKeyController.dispose();
     super.dispose();
   }
 
-  void _ss(VoidCallback fn) {
-    if (!_disposed && mounted) setState(fn);
+  /// Safe setState — no-ops after dispose or when widget is unmounted.
+  void _safeSetState(VoidCallback fn) {
+    if (!_isDisposed && mounted) setState(fn);
   }
 
-  void _log(String msg) => _ss(() => _logs += '$msg\n');
+  void _appendLog(String message) => _safeSetState(() => _logOutput += '$message\n');
 
-  Map<String, String> get _headers => {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'Authorization': 'Bearer $_apiKey',
-      };
+  // HTTP headers
+  Map<String, String> get _requestHeaders => {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'Authorization': 'Bearer $_apiKey',
+  };
 
-  Map<String, dynamic> get _vsNs => {'scope': 'node', 'id': _nodeId};
+  // ValueStore namespace scopes all keys to this specific Pi node.
+  Map<String, dynamic> get _valueStoreNamespace => {'scope': 'node', 'id': _nodeId};
 
-  Future<void> _vsSet(String key, String value) async {
-    final r = await http.post(
-      Uri.parse('$_kApiBase/valuestore/setValue'),
-      headers: _headers,
-      body: jsonEncode({'namespace': _vsNs, 'key': key, 'value': value, 'type': 'string'}),
+  /// Writes [value] under [key] in this node's ValueStore.
+  /// Used to publish the SDP offer so the Pi can read it over MQTT.
+  Future<void> _writeToValueStore(String key, String value) async {
+    final response = await http.post(
+      Uri.parse('$anedyaApiBase/valuestore/setValue'),
+      headers: _requestHeaders,
+      body: jsonEncode({
+        'namespace': _valueStoreNamespace,
+        'key': key,
+        'value': value,
+        'type': 'string',
+      }),
     );
-    if (r.statusCode < 200 || r.statusCode >= 300) {
-      throw Exception('vsSet failed: ${r.statusCode} ${r.body}');
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('ValueStore write failed: ${response.statusCode} ${response.body}');
     }
   }
 
-  Future<String?> _vsGet(String key) async {
-    final r = await http.post(
-      Uri.parse('$_kApiBase/valuestore/getValue'),
-      headers: _headers,
-      body: jsonEncode({'namespace': _vsNs, 'key': key}),
+  /// Reads [key] from this node's ValueStore.
+  /// Returns null if the key does not exist yet or on HTTP error.
+  /// Used to poll for the Pi's SDP answer.
+  Future<String?> _readFromValueStore(String key) async {
+    final response = await http.post(
+      Uri.parse('$anedyaApiBase/valuestore/getValue'),
+      headers: _requestHeaders,
+      body: jsonEncode({'namespace': _valueStoreNamespace, 'key': key}),
     );
-    if (r.statusCode < 200 || r.statusCode >= 300) return null;
-    final d = jsonDecode(r.body);
-    if (d is! Map<String, dynamic>) return null;
-    final v = d['value'];
-    return v is String && v.isNotEmpty ? v : null;
+    if (response.statusCode < 200 || response.statusCode >= 300) return null;
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) return null;
+    final value = decoded['value'];
+    return value is String && value.isNotEmpty ? value : null;
   }
 
-  Future<Map<String, dynamic>> _fetchTurn() async {
-    final r = await http.post(
-      Uri.parse('$_kApiBase/relay/create'),
-      headers: _headers,
+  /// Asks Anedya to provision a short-lived TURN relay for this session.
+  /// Returns relay data including username, credential, and expiry timestamp.
+  ///
+  /// Both the app and the Pi use the same TURN allocation details so they
+  /// can reach each other even through strict NAT.
+  Future<Map<String, dynamic>> _fetchTurnCredentials() async {
+    final response = await http.post(
+      Uri.parse('$anedyaApiBase/relay/create'),
+      headers: _requestHeaders,
       body: jsonEncode({'relayType': 'turn'}),
     );
-    if (r.statusCode < 200 || r.statusCode >= 300) {
-      throw Exception('TURN fetch failed: ${r.statusCode}');
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('TURN fetch failed: ${response.statusCode}');
     }
-    final d = jsonDecode(r.body);
-    if (d is! Map<String, dynamic> || d['relayData'] is! Map) {
-      throw Exception(d['error']?.toString() ?? 'No relayData');
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic> || decoded['relayData'] is! Map) {
+      throw Exception(decoded['error']?.toString() ?? 'No relayData in response');
     }
-    final rd = Map<String, dynamic>.from(d['relayData'] as Map);
-    rd['password'] = rd['credential'];
-    rd['relayExpiry'] = d['relayExpiry'];
-    return rd;
+    final relayData = Map<String, dynamic>.from(decoded['relayData'] as Map);
+    // flutter_webrtc expects the field named 'password'; Anedya returns it as 'credential'.
+    relayData['password'] = relayData['credential'];
+    relayData['relayExpiry'] = decoded['relayExpiry'];
+    return relayData;
   }
 
-  void _sendCmd(Map<String, dynamic> cmd) {
-    final dc = _dc;
-    if (dc != null && dc.state == RTCDataChannelState.RTCDataChannelOpen) {
-      dc.send(RTCDataChannelMessage(jsonEncode(cmd)));
+  /// Sends a JSON command to the Pi over the WebRTC data channel.
+  /// No-ops silently if the channel is not open yet.
+  ///
+  /// Supported commands:
+  ///   { cmd: 'timeline' }           — request current timeline state
+  ///   { cmd: 'seek', offset: <s> }  — jump to position in seconds
+  ///   { cmd: 'live' }               — return to live (streaming) mode
+  void _sendDataChannelCommand(Map<String, dynamic> command) {
+    final channel = _dataChannel;
+    if (channel != null && channel.state == RTCDataChannelState.RTCDataChannelOpen) {
+      channel.send(RTCDataChannelMessage(jsonEncode(command)));
     }
   }
 
-  void _renderTimeline(Map<String, dynamic> msg) {
-    final duration = (msg['duration'] as num?)?.toDouble() ?? 0.0;
-    final position = msg['playback_offset'] != null
-        ? (msg['playback_offset'] as num).toDouble()
-        : duration;
+  /// Applies a timeline message from the Pi and updates the slider UI.
+  ///
+  /// Message shape:
+  ///   { type: 'timeline', duration: <s>, playback_offset: <s>, mode: 'live'|'playback' }
+  ///
+  /// [duration]        = total recorded seconds available for scrubbing.
+  /// [playback_offset] = Pi's current read position (absent when in live mode).
+  void _applyTimelineUpdate(Map<String, dynamic> timelineData) {
+    final totalDuration = (timelineData['duration'] as num?)?.toDouble() ?? 0.0;
+    final playbackPosition = timelineData['playback_offset'] != null
+        ? (timelineData['playback_offset'] as num).toDouble()
+        : totalDuration;
 
-    _ss(() {
-      _showTimeline = true;
-      _sliderMax = duration;
-      if (!_draggingSlider) {
-        _sliderValue = duration > 0 ? position.clamp(0.0, duration) : 0.0;
+    _safeSetState(() {
+      _showTimelinePanel = true;
+      _totalRecordedSeconds = totalDuration;
+
+      // Don't override slider position while the user is actively dragging it.
+      if (!_isUserScrubbing) {
+        _currentPositionSeconds = totalDuration > 0
+            ? playbackPosition.clamp(0.0, totalDuration)
+            : 0.0;
       }
-      _timelineCurrent = _fmtTime(_sliderValue);
-      _timelineEnd = duration > 0 ? _fmtTime(duration) : 'LIVE';
 
-      if (duration <= 0) {
-        _timelineStatus =
+      _currentTimeLabel = _formatDuration(_currentPositionSeconds);
+      _totalDurationLabel = totalDuration > 0 ? _formatDuration(totalDuration) : 'LIVE';
+
+      if (totalDuration <= 0) {
+        // No segments finalized yet — recording just started.
+        _timelineStatusText =
             'Recording starts immediately. Playback appears after first finalized segment.';
-        _showLiveBtn = false;
+        _showGoLiveButton = false;
         return;
       }
 
-      if (msg['mode'] == 'live') {
-        _timelineStatus = 'Live mode';
-        _showLiveBtn = false;
+      if (timelineData['mode'] == 'live') {
+        _timelineStatusText = 'Live mode';
+        _showGoLiveButton = false;
       } else {
-        final behind = (duration - position).clamp(0.0, double.infinity);
-        _timelineStatus = 'Playback mode - ${_fmtTime(behind)} behind live';
-        _showLiveBtn = true;
+        final secondsBehindLive = (totalDuration - playbackPosition).clamp(0.0, double.infinity);
+        _timelineStatusText = 'Playback mode - ${_formatDuration(secondsBehindLive)} behind live';
+        // Show Go Live button so the user can return to the live edge.
+        _showGoLiveButton = true;
       }
     });
   }
 
-  String _fmtTime(double totalSeconds) {
-    final s = totalSeconds.clamp(0, double.infinity).toInt();
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    if (h > 0) {
-      return '${h.toString().padLeft(2, '0')}:${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}';
+  /// Formats a duration in seconds to MM:SS or HH:MM:SS.
+  String _formatDuration(double totalSeconds) {
+    final seconds = totalSeconds.clamp(0, double.infinity).toInt();
+    final hours = seconds ~/ 3600;
+    final minutes = (seconds % 3600) ~/ 60;
+    final secs = seconds % 60;
+    if (hours > 0) {
+      return '${hours.toString().padLeft(2, '0')}:'
+          '${minutes.toString().padLeft(2, '0')}:'
+          '${secs.toString().padLeft(2, '0')}';
     }
-    return '${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}';
+    return '${minutes.toString().padLeft(2, '0')}:${secs.toString().padLeft(2, '0')}';
   }
 
-  void _resetTimeline() {
-    _ss(() {
-      _showTimeline = false;
-      _showLiveBtn = false;
-      _sliderMax = 0.0;
-      _sliderValue = 0.0;
-      _draggingSlider = false;
-      _timelineCurrent = '00:00';
-      _timelineEnd = 'LIVE';
-      _timelineStatus =
+  void _resetTimelineState() {
+    _safeSetState(() {
+      _showTimelinePanel = false;
+      _showGoLiveButton = false;
+      _totalRecordedSeconds = 0.0;
+      _currentPositionSeconds = 0.0;
+      _isUserScrubbing = false;
+      _currentTimeLabel = '00:00';
+      _totalDurationLabel = 'LIVE';
+      _timelineStatusText =
           'Recording starts immediately. Playback appears after first finalized segment.';
     });
   }
 
+  /// Runs the full WebRTC signaling flow:
+  ///   Step 1 → fetch TURN credentials
+  ///   Step 2 → create peer connection + data channel + transceivers
+  ///   Step 3 → create SDP offer, gather ICE candidates
+  ///   Step 4 → write offer + TURN data to ValueStore (Pi reads this over MQTT)
+  ///   Step 5 → poll ValueStore for Pi's answer, apply it
   Future<void> _startStream() async {
-    _pollTimer?.cancel();
-    _timelineTimer?.cancel();
-    await _closePc();
+    _answerPollTimer?.cancel();
+    _timelinePollTimer?.cancel();
+    await _closePeerConnection();
 
-    _ss(() {
-      _status = 'Fetching TURN credentials...';
-      _isStreaming = true;
-      _hasError = false;
+    _safeSetState(() {
+      _statusText = 'Fetching TURN credentials...';
+      _isStreamActive = true;
+      _isInErrorState = false;
     });
 
-    Map<String, dynamic> relay;
+    // Step 1: fetch short-lived TURN credentials from Anedya.
+    Map<String, dynamic> turnCredentials;
     try {
-      relay = await _fetchTurn();
-      final exp = relay['relayExpiry'];
-      _log(exp is num
-          ? 'TURN ready (expires ${DateTime.fromMillisecondsSinceEpoch(exp.toInt() * 1000).toLocal().toIso8601String()})'
-          : 'TURN ready');
-    } catch (e) {
-      _failWithError('TURN error: $e');
+      turnCredentials = await _fetchTurnCredentials();
+      final relayExpiry = turnCredentials['relayExpiry'];
+      _appendLog(
+        relayExpiry is num
+            ? 'TURN ready (expires ${DateTime.fromMillisecondsSinceEpoch(relayExpiry.toInt() * 1000).toLocal().toIso8601String()})'
+            : 'TURN ready',
+      );
+    } catch (error) {
+      _handleError('TURN error: $error');
       return;
     }
 
+    // Step 2: create the peer connection, data channel, and receive-only transceivers.
     try {
-      _pc = await createPeerConnection({
-        'iceTransportPolicy': _relayOnly ? 'relay' : 'all',
+      _peerConnection = await createPeerConnection({
+        // When relay-only is on, force all traffic through TURN — useful for
+        // debugging NAT issues or confirming TURN is working.
+        'iceTransportPolicy': _forceRelayOnly ? 'relay' : 'all',
         'iceServers': [
           {
-            'urls': [
-              'stun:turn1.ap-in-1.anedya.io:3478',
-              'turn:turn1.ap-in-1.anedya.io:3478',
-            ],
-            'username': relay['username'],
-            'credential': relay['password'],
-          }
+            'urls': ['stun:turn1.ap-in-1.anedya.io:3478', 'turn:turn1.ap-in-1.anedya.io:3478'],
+            'username': turnCredentials['username'],
+            'credential': turnCredentials['password'],
+          },
         ],
       });
 
-      final dcInit = RTCDataChannelInit()..ordered = true;
-      _dc = await _pc!.createDataChannel('control', dcInit);
+      // Data channel must be created before the offer so its m-line is included
+      // in the SDP. Ordered delivery ensures commands arrive in sequence.
+      final dataChannelConfig = RTCDataChannelInit()..ordered = true;
+      _dataChannel = await _peerConnection!.createDataChannel('control', dataChannelConfig);
 
-      _dc!.onDataChannelState = (state) {
+      _dataChannel!.onDataChannelState = (state) {
         if (state == RTCDataChannelState.RTCDataChannelOpen) {
-          _log('DataChannel open - requesting timeline');
-          _ss(() => _showTimeline = true);
-          _sendCmd({'cmd': 'timeline'});
-          _timelineTimer = Timer.periodic(
+          _appendLog('DataChannel open - requesting timeline');
+          _safeSetState(() => _showTimelinePanel = true);
+          // Request an initial timeline snapshot immediately, then poll
+          // every 2 seconds so the slider updates as recording grows.
+          _sendDataChannelCommand({'cmd': 'timeline'});
+          _timelinePollTimer = Timer.periodic(
             const Duration(seconds: 2),
-            (_) => _sendCmd({'cmd': 'timeline'}),
+            (_) => _sendDataChannelCommand({'cmd': 'timeline'}),
           );
         }
       };
 
-      _dc!.onMessage = (msg) {
-        final data = jsonDecode(msg.text) as Map<String, dynamic>;
+      _dataChannel!.onMessage = (message) {
+        final data = jsonDecode(message.text) as Map<String, dynamic>;
         if (data['type'] == 'timeline') {
-          _renderTimeline(data);
+          _applyTimelineUpdate(data);
         } else if (data['type'] == 'error') {
-          _log('Error: ${data['message']}');
+          _appendLog('Error from Pi: ${data['message']}');
         }
       };
 
-      await _pc!.addTransceiver(
+      // This app is viewer-only — it receives video and audio but never sends any.
+      await _peerConnection!.addTransceiver(
         kind: RTCRtpMediaType.RTCRtpMediaTypeVideo,
         init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
       );
-      await _pc!.addTransceiver(
+      await _peerConnection!.addTransceiver(
         kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
         init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
       );
 
-      _pc!.onTrack = (e) {
-        _log('Got remote track: ${e.track.kind}');
-        if (e.streams.isNotEmpty) {
-          _renderer.srcObject = e.streams.first;
-          _ss(() {
-            _status = 'Streaming';
-            _hasError = false;
+      _peerConnection!.onTrack = (trackEvent) {
+        _appendLog('Got remote track: ${trackEvent.track.kind}');
+        if (trackEvent.streams.isNotEmpty) {
+          _videoRenderer.srcObject = trackEvent.streams.first;
+          _safeSetState(() {
+            _statusText = 'Streaming';
+            _isInErrorState = false;
           });
         }
       };
 
-      _pc!.onConnectionState = (state) async {
-        _log('PC state: ${state.name}');
-        if (state == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
-          await _logTransport();
-        } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
-          _failWithError('Connection failed');
+      _peerConnection!.onConnectionState = (connectionState) async {
+        _appendLog('PC state: ${connectionState.name}');
+        if (connectionState == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+          await _logConnectionType();
+        } else if (connectionState == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+          _handleError('Connection failed');
           stopStream(logStop: false);
         }
       };
-    } catch (e) {
-      _failWithError('Peer setup error: $e');
+    } catch (error) {
+      _handleError('Peer setup error: $error');
       stopStream(logStop: false);
       return;
     }
 
+    // Step 3: create the SDP offer and wait for ICE candidate gathering.
     try {
-      _ss(() => _status = 'Gathering ICE...');
-      final offer = await _pc!.createOffer();
-      await _pc!.setLocalDescription(offer);
+      _safeSetState(() => _statusText = 'Gathering ICE...');
+      final offer = await _peerConnection!.createOffer();
+      await _peerConnection!.setLocalDescription(offer);
 
+      // ICE gathering state-change callbacks are unreliable on some platforms,
+      // so a fixed 2-second wait is used. This is sufficient for local and
+      // STUN-derived candidates to be gathered on most networks.
       await Future.delayed(const Duration(seconds: 2));
 
-      final local = await _pc!.getLocalDescription();
-      if (local == null) throw Exception('Local description null');
+      final localDescription = await _peerConnection!.getLocalDescription();
+      if (localDescription == null) throw Exception('Local description is null');
 
-      final sessionId = _newSessionId();
+      // Step 4: write the offer + TURN credentials to ValueStore.
+      // The Pi receives this as an MQTT notification and begins its answer flow.
+      // TURN credentials are bundled so both sides use the same relay allocation.
+      final sessionId = _generateSessionId();
       final offerKey = 'offer_$sessionId';
       final answerKey = 'answer_$sessionId';
 
-      _ss(() => _status = 'Sending offer...');
-      await _vsSet(
+      _safeSetState(() => _statusText = 'Sending offer...');
+      await _writeToValueStore(
         offerKey,
         jsonEncode({
-          'offer': {'sdp': local.sdp, 'type': local.type},
-          'turn': relay,
+          'offer': {'sdp': localDescription.sdp, 'type': localDescription.type},
+          'turn': turnCredentials,
         }),
       );
-      _log('Offer written (key=$offerKey) - polling for answer...');
-      _ss(() => _status = 'Waiting for Pi...');
+      _appendLog('Offer written (key=$offerKey) - polling for answer...');
+      _safeSetState(() => _statusText = 'Waiting for Pi...');
 
-      _startPollAnswer(answerKey);
-    } catch (e) {
-      _failWithError('Offer flow error: $e');
+      // Step 5: poll for the Pi's answer.
+      _startPollingForAnswer(answerKey);
+    } catch (error) {
+      _handleError('Offer flow error: $error');
       stopStream(logStop: false);
     }
   }
 
-  void _startPollAnswer(String answerKey) {
-    int attempts = 0;
-    _pollTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
-      attempts++;
-      if (attempts > 30) {
+  /// Polls ValueStore every 2 seconds for up to 60 seconds (30 attempts).
+  /// Once the Pi's answer arrives, sets the remote description to complete
+  /// the WebRTC handshake and allow media to flow.
+  void _startPollingForAnswer(String answerKey) {
+    int pollAttempts = 0;
+    _answerPollTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+      pollAttempts++;
+      if (pollAttempts > 30) {
         timer.cancel();
-        _pollTimer = null;
-        _failWithError('Timeout: Pi did not respond in time');
+        _answerPollTimer = null;
+        _handleError('Timeout: Pi did not respond in time');
         stopStream(logStop: false);
         return;
       }
       try {
-        final value = await _vsGet(answerKey);
-        if (value == null) return;
+        final answerPayload = await _readFromValueStore(answerKey);
+        if (answerPayload == null) return; // not written yet — try again next tick
         timer.cancel();
-        _pollTimer = null;
-        final d = jsonDecode(value) as Map<String, dynamic>;
-        await _pc?.setRemoteDescription(
-          RTCSessionDescription(d['sdp'] as String, d['type'] as String),
+        _answerPollTimer = null;
+        final answerSdp = jsonDecode(answerPayload) as Map<String, dynamic>;
+        await _peerConnection?.setRemoteDescription(
+          RTCSessionDescription(answerSdp['sdp'] as String, answerSdp['type'] as String),
         );
-        _log('Answer applied - WebRTC connecting...');
-      } catch (e) {
-        _log('Poll error: $e');
+        _appendLog('Answer applied - WebRTC connecting...');
+      } catch (error) {
+        _appendLog('Poll error: $error');
       }
     });
   }
 
+  /// Tears down the active stream: cancels timers, closes the peer connection,
+  /// clears the video renderer, and resets all UI state back to idle.
   Future<void> stopStream({bool logStop = true}) async {
-    _pollTimer?.cancel();
-    _pollTimer = null;
-    _timelineTimer?.cancel();
-    _timelineTimer = null;
+    _answerPollTimer?.cancel();
+    _answerPollTimer = null;
+    _timelinePollTimer?.cancel();
+    _timelinePollTimer = null;
 
-    await _closePc();
-    _renderer.srcObject = null;
-    _resetTimeline();
+    await _closePeerConnection();
+    _videoRenderer.srcObject = null;
+    _resetTimelineState();
 
-    if (logStop) _log('Stream stopped');
-    _ss(() {
-      _status = 'Ready - press Start';
-      _isStreaming = false;
-      _hasError = false;
+    if (logStop) _appendLog('Stream stopped');
+    _safeSetState(() {
+      _statusText = 'Ready - press Start';
+      _isStreamActive = false;
+      _isInErrorState = false;
     });
   }
 
-  Future<void> _closePc() async {
-    final pc = _pc;
-    _pc = null;
-    _dc = null;
-    if (pc != null) {
+  Future<void> _closePeerConnection() async {
+    final connection = _peerConnection;
+    _peerConnection = null;
+    _dataChannel = null;
+    if (connection != null) {
       try {
-        await pc.close();
+        await connection.close();
       } catch (_) {}
     }
   }
 
-  Future<void> _logTransport() async {
-    final pc = _pc;
-    if (pc == null) return;
+  /// Reads WebRTC stats after connection to log whether traffic is flowing
+  /// through the TURN relay or directly P2P — useful for diagnosing NAT issues.
+  Future<void> _logConnectionType() async {
+    final connection = _peerConnection;
+    if (connection == null) return;
     try {
-      final stats = await pc.getStats();
-      final byId = {for (final r in stats) r.id: r};
-      for (final r in stats) {
-        if (r.type != 'candidate-pair') continue;
-        if (r.values['state']?.toString() != 'succeeded') continue;
-        final localId = r.values['localCandidateId']?.toString();
-        final remoteId = r.values['remoteCandidateId']?.toString();
-        final lt = localId == null ? null : byId[localId]?.values['candidateType']?.toString();
-        final rt = remoteId == null ? null : byId[remoteId]?.values['candidateType']?.toString();
-        _log(lt == 'relay' || rt == 'relay' ? 'Candidate type: TURN' : 'Candidate type: P2P');
+      final stats = await connection.getStats();
+      final statsById = {for (final report in stats) report.id: report};
+      for (final report in stats) {
+        if (report.type != 'candidate-pair') continue;
+        if (report.values['state']?.toString() != 'succeeded') continue;
+        final localCandidateId = report.values['localCandidateId']?.toString();
+        final remoteCandidateId = report.values['remoteCandidateId']?.toString();
+        final localCandidateType = localCandidateId == null
+            ? null
+            : statsById[localCandidateId]?.values['candidateType']?.toString();
+        final remoteCandidateType = remoteCandidateId == null
+            ? null
+            : statsById[remoteCandidateId]?.values['candidateType']?.toString();
+        _appendLog(
+          localCandidateType == 'relay' || remoteCandidateType == 'relay'
+              ? 'Candidate type: TURN (relayed)'
+              : 'Candidate type: P2P (direct)',
+        );
         return;
       }
-    } catch (e) {
-      _log('Stats error: $e');
+    } catch (error) {
+      _appendLog('Stats error: $error');
     }
   }
 
-  void _failWithError(String msg) {
-    _log(msg);
-    _ss(() {
-      _status = msg.startsWith('Connection failed') ? 'Connection failed' : 'Error';
-      _hasError = true;
-      _isStreaming = false;
+  void _handleError(String message) {
+    _appendLog(message);
+    _safeSetState(() {
+      _statusText = message.startsWith('Connection failed') ? 'Connection failed' : 'Error';
+      _isInErrorState = true;
+      _isStreamActive = false;
     });
   }
 
-  String _newSessionId() {
+  /// Generates a random 8-character alphanumeric session ID to namespace the
+  /// offer/answer ValueStore keys so concurrent sessions do not collide.
+  String _generateSessionId() {
     const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    final rand = Random.secure();
-    return List.generate(8, (_) => chars[rand.nextInt(chars.length)]).join();
+    final random = Random.secure();
+    return List.generate(8, (_) => chars[random.nextInt(chars.length)]).join();
   }
 
-  Color get _statusBg {
-    if (_hasError) return const Color(0xFF450A0A);
-    if (_isStreaming || _status.startsWith('Ready')) return const Color(0xFF14532D);
+  // Status badge colors
+  Color get _statusBackgroundColor {
+    if (_isInErrorState) return const Color(0xFF450A0A);
+    if (_isStreamActive || _statusText.startsWith('Ready')) return const Color(0xFF14532D);
     return const Color(0xFF222222);
   }
 
-  Color get _statusFg {
-    if (_hasError) return const Color(0xFFF87171);
-    if (_isStreaming || _status.startsWith('Ready')) return const Color(0xFF4ADE80);
+  Color get _statusTextColor {
+    if (_isInErrorState) return const Color(0xFFF87171);
+    if (_isStreamActive || _statusText.startsWith('Ready')) return const Color(0xFF4ADE80);
     return const Color(0xFFEEEEEE);
   }
 
   @override
   Widget build(BuildContext context) {
-    final w = MediaQuery.of(context).size.width.clamp(0.0, 640.0);
+    final contentWidth = MediaQuery.of(context).size.width.clamp(0.0, 640.0);
     return Scaffold(
       backgroundColor: const Color(0xFF0A0A0A),
       body: SafeArea(
@@ -456,24 +549,27 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           padding: const EdgeInsets.all(16),
           child: Center(
             child: SizedBox(
-              width: w,
+              width: contentWidth,
               child: Column(
                 children: [
                   _buildHeader(),
                   const SizedBox(height: 8),
-                  _buildStatus(),
+                  _buildStatusBadge(),
                   const SizedBox(height: 16),
-                  _buildVideo(),
+                  _buildVideoView(),
                   const SizedBox(height: 8),
-                  _buildToolbar(),
+                  _buildSettingsToolbar(),
                   const SizedBox(height: 8),
-                  _buildButtons(),
+                  _buildControlButtons(),
                   const SizedBox(height: 8),
-                  _buildRelayToggle(),
-                  if (_showSettings) ...[const SizedBox(height: 8), _buildSettingsPanel()],
-                  if (_showTimeline) ...[const SizedBox(height: 8), _buildTimeline()],
+                  _buildRelayOnlyToggle(),
+                  if (_isSettingsPanelVisible) ...[
+                    const SizedBox(height: 8),
+                    _buildSettingsPanel(),
+                  ],
+                  if (_showTimelinePanel) ...[const SizedBox(height: 8), _buildTimelinePanel()],
                   const SizedBox(height: 8),
-                  _buildLogs(),
+                  _buildLogOutput(),
                 ],
               ),
             ),
@@ -489,12 +585,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       children: [
         const Text(
           'PI CAM',
-          style: TextStyle(
-            color: Color(0xFFEEEEEE),
-            fontSize: 19,
-            letterSpacing: 0.95,
-          ),
+          style: TextStyle(color: Color(0xFFEEEEEE), fontSize: 19, letterSpacing: 0.95),
         ),
+        // QR icon opens the scanner. The streamer prints a QR payload on startup
+        // that encodes the node_id — scan it instead of typing the UUID manually.
         IconButton(
           icon: const Icon(Icons.qr_code_scanner, color: Colors.white),
           onPressed: () async {
@@ -502,13 +596,13 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
               context,
               MaterialPageRoute(
                 builder: (_) => QRScannerScreen(
-                  onScan: (nodeId) {
-                    _ss(() {
-                      _nodeId = nodeId;
-                      _nodeIdCtrl.text = nodeId;
-                      _status = 'Node set via QR';
+                  onNodeIdScanned: (scannedNodeId) {
+                    _safeSetState(() {
+                      _nodeId = scannedNodeId;
+                      _nodeIdController.text = scannedNodeId;
+                      _statusText = 'Node set via QR';
                     });
-                    _savePrefs();
+                    _saveSettings();
                   },
                 ),
               ),
@@ -519,28 +613,28 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     );
   }
 
-  Widget _buildStatus() {
+  Widget _buildStatusBadge() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 7),
       decoration: BoxDecoration(
-        color: _statusBg,
+        color: _statusBackgroundColor,
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(
-        _nodeId.isNotEmpty ? _status : 'No device configured — tap Settings',
-        style: TextStyle(color: _statusFg, fontSize: 13.6),
+        _nodeId.isNotEmpty ? _statusText : 'No device configured — tap Settings',
+        style: TextStyle(color: _statusTextColor, fontSize: 13.6),
       ),
     );
   }
 
-  Widget _buildVideo() {
+  Widget _buildVideoView() {
     return AspectRatio(
       aspectRatio: 16 / 9,
       child: ClipRRect(
         borderRadius: BorderRadius.circular(12),
         child: Container(
           color: const Color(0xFF111111),
-          child: _renderer.srcObject == null
+          child: _videoRenderer.srcObject == null
               ? const Center(
                   child: Text(
                     'Video Feed',
@@ -548,7 +642,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
                   ),
                 )
               : RTCVideoView(
-                  _renderer,
+                  _videoRenderer,
                   objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
                 ),
         ),
@@ -556,11 +650,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     );
   }
 
-  Widget _buildToolbar() {
+  Widget _buildSettingsToolbar() {
     return Align(
       alignment: Alignment.centerRight,
       child: TextButton(
-        onPressed: () => _ss(() => _showSettings = !_showSettings),
+        onPressed: () => _safeSetState(() => _isSettingsPanelVisible = !_isSettingsPanelVisible),
         style: TextButton.styleFrom(
           backgroundColor: const Color(0xFF374151),
           foregroundColor: Colors.white,
@@ -572,44 +666,53 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     );
   }
 
-  Widget _buildButtons() {
-    final hasDevice = _nodeId.isNotEmpty;
+  Widget _buildControlButtons() {
+    final hasDeviceConfigured = _nodeId.isNotEmpty;
     return Column(
       children: [
         Row(
           children: [
             Expanded(
-              child: _btn(
-                'Start Stream',
-                const Color(0xFF2563EB),
-                (!hasDevice || _isStreaming) ? null : _startStream,
+              child: _buildButton(
+                label: 'Start Stream',
+                color: const Color(0xFF2563EB),
+                onPressed: (!hasDeviceConfigured || _isStreamActive) ? null : _startStream,
               ),
             ),
             const SizedBox(width: 12),
             Expanded(
-              child: _btn(
-                'Stop Stream',
-                const Color(0xFFDC2626),
-                (!hasDevice || !_isStreaming) ? null : () => stopStream(),
+              child: _buildButton(
+                label: 'Stop Stream',
+                color: const Color(0xFFDC2626),
+                onPressed: (!hasDeviceConfigured || !_isStreamActive) ? null : () => stopStream(),
               ),
             ),
           ],
         ),
-        if (_showLiveBtn) ...[
+        // Go Live appears only when the Pi is in playback mode (scrubbing behind live).
+        if (_showGoLiveButton) ...[
           const SizedBox(height: 8),
           SizedBox(
             width: double.infinity,
-            child: _btn('Go Live', const Color(0xFF059669), () {
-              _sendCmd({'cmd': 'live'});
-              _log('Switched to live');
-            }),
+            child: _buildButton(
+              label: 'Go Live',
+              color: const Color(0xFF059669),
+              onPressed: () {
+                _sendDataChannelCommand({'cmd': 'live'});
+                _appendLog('Switched to live');
+              },
+            ),
           ),
         ],
       ],
     );
   }
 
-  Widget _btn(String label, Color color, VoidCallback? onPressed) {
+  Widget _buildButton({
+    required String label,
+    required Color color,
+    required VoidCallback? onPressed,
+  }) {
     return ElevatedButton(
       onPressed: onPressed,
       style: ElevatedButton.styleFrom(
@@ -626,15 +729,15 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     );
   }
 
-  Widget _buildRelayToggle() {
+  Widget _buildRelayOnlyToggle() {
     return Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
         Checkbox(
-          value: _relayOnly,
-          onChanged: (v) {
-            _ss(() => _relayOnly = v ?? false);
-            _savePrefs();
+          value: _forceRelayOnly,
+          onChanged: (isChecked) {
+            _safeSetState(() => _forceRelayOnly = isChecked ?? false);
+            _saveSettings();
           },
           activeColor: const Color(0xFF2563EB),
         ),
@@ -661,21 +764,30 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
             style: TextStyle(color: Color(0x99EEEEEE), fontSize: 14, letterSpacing: 0.8),
           ),
           const SizedBox(height: 14),
-          _field('Anedya Node ID', _nodeIdCtrl, 'Node UUID'),
+          _buildInputField(
+            label: 'Anedya Node ID',
+            controller: _nodeIdController,
+            hint: 'Node UUID',
+          ),
           const SizedBox(height: 12),
-          _field('Anedya API Key', _apiKeyCtrl, 'Raw API key (no Bearer prefix)', obscure: true),
+          _buildInputField(
+            label: 'Anedya API Key',
+            controller: _apiKeyController,
+            hint: 'Raw API key (no Bearer prefix)',
+            obscureText: true,
+          ),
           const SizedBox(height: 14),
           SizedBox(
             width: double.infinity,
             child: ElevatedButton(
               onPressed: () {
-                _ss(() {
-                  _nodeId = _nodeIdCtrl.text.trim();
-                  _apiKey = _apiKeyCtrl.text.trim();
-                  _showSettings = false;
+                _safeSetState(() {
+                  _nodeId = _nodeIdController.text.trim();
+                  _apiKey = _apiKeyController.text.trim();
+                  _isSettingsPanelVisible = false;
                 });
-                _savePrefs();
-                _log('Settings saved');
+                _saveSettings();
+                _appendLog('Settings saved');
               },
               style: ElevatedButton.styleFrom(
                 backgroundColor: const Color(0xFF374151),
@@ -698,11 +810,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     );
   }
 
-  Widget _field(
-    String label,
-    TextEditingController ctrl,
-    String hint, {
-    bool obscure = false,
+  Widget _buildInputField({
+    required String label,
+    required TextEditingController controller,
+    required String hint,
+    bool obscureText = false,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -710,8 +822,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         Text(label, style: const TextStyle(color: Color(0xBFEEEEEE), fontSize: 13)),
         const SizedBox(height: 6),
         TextField(
-          controller: ctrl,
-          obscureText: obscure,
+          controller: controller,
+          obscureText: obscureText,
           style: const TextStyle(color: Color(0xFFEEEEEE), fontSize: 15),
           decoration: InputDecoration(
             hintText: hint,
@@ -733,7 +845,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     );
   }
 
-  Widget _buildTimeline() {
+  /// Timeline panel — shows current position, total duration, and a scrub slider.
+  /// Appears once the data channel opens; the slider becomes interactive only after
+  /// the Pi finalizes its first recording segment (totalRecordedSeconds > 0).
+  Widget _buildTimelinePanel() {
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -746,31 +861,37 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
               Text(
-                _timelineCurrent,
+                _currentTimeLabel,
                 style: const TextStyle(color: Color(0xBFEEEEEE), fontSize: 13),
               ),
               Text(
-                _timelineEnd,
+                _totalDurationLabel,
                 style: const TextStyle(color: Color(0xBFEEEEEE), fontSize: 13),
               ),
             ],
           ),
           Slider(
-            value: _sliderMax > 0 ? _sliderValue.clamp(0, _sliderMax) : 0,
+            value: _totalRecordedSeconds > 0
+                ? _currentPositionSeconds.clamp(0, _totalRecordedSeconds)
+                : 0,
             min: 0,
-            max: _sliderMax > 0 ? _sliderMax : 1,
-            onChangeStart: _sliderMax > 0 ? (_) => _ss(() => _draggingSlider = true) : null,
-            onChanged: _sliderMax > 0
-                ? (v) => _ss(() {
-                      _sliderValue = v;
-                      _timelineCurrent = _fmtTime(v);
-                    })
+            max: _totalRecordedSeconds > 0 ? _totalRecordedSeconds : 1,
+            // Null callbacks render the slider as disabled (no recorded footage yet).
+            onChangeStart: _totalRecordedSeconds > 0
+                ? (_) => _safeSetState(() => _isUserScrubbing = true)
                 : null,
-            onChangeEnd: _sliderMax > 0
-                ? (v) {
-                    _ss(() => _draggingSlider = false);
-                    _sendCmd({'cmd': 'seek', 'offset': v});
-                    _log('Seeking to ${_fmtTime(v)}');
+            onChanged: _totalRecordedSeconds > 0
+                ? (newPosition) => _safeSetState(() {
+                    _currentPositionSeconds = newPosition;
+                    _currentTimeLabel = _formatDuration(newPosition);
+                  })
+                : null,
+            onChangeEnd: _totalRecordedSeconds > 0
+                ? (selectedPosition) {
+                    _safeSetState(() => _isUserScrubbing = false);
+                    // Tell the Pi to jump to this position in the recording.
+                    _sendDataChannelCommand({'cmd': 'seek', 'offset': selectedPosition});
+                    _appendLog('Seeking to ${_formatDuration(selectedPosition)}');
                   }
                 : null,
             activeColor: const Color(0xFF2563EB),
@@ -779,7 +900,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           Align(
             alignment: Alignment.centerLeft,
             child: Text(
-              _timelineStatus,
+              _timelineStatusText,
               style: const TextStyle(color: Color(0xBFEEEEEE), fontSize: 12),
             ),
           ),
@@ -788,11 +909,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     );
   }
 
-  Widget _buildLogs() {
+  Widget _buildLogOutput() {
     return Align(
       alignment: Alignment.centerLeft,
       child: Text(
-        _logs,
+        _logOutput,
         style: const TextStyle(color: Color(0x80EEEEEE), fontSize: 12, height: 1.6),
       ),
     );

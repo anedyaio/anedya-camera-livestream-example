@@ -4,9 +4,9 @@ import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 
 class QRScannerScreen extends StatefulWidget {
-  final void Function(String nodeId) onScan;
+  final void Function(String nodeId) onNodeIdScanned;
 
-  const QRScannerScreen({super.key, required this.onScan});
+  const QRScannerScreen({super.key, required this.onNodeIdScanned});
 
   @override
   State<QRScannerScreen> createState() => _QRScannerScreenState();
@@ -25,7 +25,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
 
   void _submit(String value) {
     if (value.trim().isEmpty) return;
-    widget.onScan(value.trim());
+    widget.onNodeIdScanned(value.trim());
     Navigator.pop(context);
   }
 
@@ -56,7 +56,7 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                         final nodeId = data['node_id']?.toString();
                         if (nodeId != null && nodeId.isNotEmpty) {
                           await _scanner.stop();
-                          widget.onScan(nodeId);
+                          widget.onNodeIdScanned(nodeId);
                           if (mounted) Navigator.pop(context);
                         }
                       } catch (_) {}
