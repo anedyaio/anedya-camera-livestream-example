@@ -248,7 +248,7 @@ http://localhost:8080
 
 The local server simply serves `peer/public/index.html`.
 
-If you don't wish to run the viewer locally you can directly access the deployed version - [Here]().
+If you don't wish to run the viewer locally you can directly access the deployed version - [Here](https://anedyaio.github.io/anedya-camera-livestream-example/).
 
 ## Step 6: Use the Viewer
 
