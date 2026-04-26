@@ -231,7 +231,7 @@ class RecordingManager:
                     self._start_new_segment(captured_at, frame_size)
 
                 if self._video_writer:
-                    self._video_writer.write(frame)
+                    await asyncio.to_thread(self._video_writer.write, frame)
 
             except asyncio.TimeoutError:
                 continue

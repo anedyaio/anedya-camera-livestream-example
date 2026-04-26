@@ -108,7 +108,7 @@ class WebcamTrack(VideoStreamTrack):
         self._current_mode         = "live"
         log.info("Switched to live mode")
 
-    def _read_next_playback_frame(self) -> np.ndarray | None:
+    async def _read_next_playback_frame(self) -> np.ndarray | None:
         """Read the next frame from the active playback file.
 
         When the current file ends, automatically opens the next segment so
@@ -118,7 +118,7 @@ class WebcamTrack(VideoStreamTrack):
         if not self._playback_capture or not self._playback_file_path:
             return None
 
-        ret, frame = self._playback_capture.read()
+        ret, frame = await asyncio.to_thread(self._playback_capture.read)
         if ret:
             return frame
 
@@ -136,7 +136,7 @@ class WebcamTrack(VideoStreamTrack):
 
         self._playback_file_path   = next_segment["path"]
         self._playback_base_offset = next_segment["start_offset"]
-        ret, frame = self._playback_capture.read()
+        ret, frame = await asyncio.to_thread(self._playback_capture.read)
         return frame if ret else None
 
     async def recv(self) -> av.VideoFrame:
@@ -151,7 +151,7 @@ class WebcamTrack(VideoStreamTrack):
         pts, time_base = await self.next_timestamp()
 
         if self._current_mode == "playback" and self._playback_capture:
-            frame = self._read_next_playback_frame()
+            frame = await self._read_next_playback_frame()
             if frame is None:
                 # Reached end of all recorded segments — fall back to live.
                 self.go_live()
@@ -163,9 +163,8 @@ class WebcamTrack(VideoStreamTrack):
                 self._last_frame_sequence
             )
 
-        # OpenCV captures BGR; aiortc / WebRTC expects RGB.
-        rgb_frame   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        video_frame = av.VideoFrame.from_ndarray(rgb_frame, format="rgb24")  # type: ignore[arg-type]
+        # Pass BGR directly - av/FFmpeg converts to YUV in one step, skipping an extra copy.
+        video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")  # type: ignore[arg-type]
         video_frame.pts       = pts
         video_frame.time_base = time_base
         return video_frame
