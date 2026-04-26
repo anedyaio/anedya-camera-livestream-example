@@ -127,9 +127,7 @@ class CameraStreamer:
         client.username_pw_set(ANEDYA_DEVICE_ID, ANEDYA_CONNECTION_KEY)
 
         tls_context = ssl.create_default_context()
-        # TODO : tls_context.load_verify_locations(cadata=ANEDYA_CA_CERT)
-        tls_context.check_hostname = False
-        tls_context.verify_mode = ssl.CERT_NONE
+        tls_context.load_verify_locations(cadata=ANEDYA_CA_CERT)
 
         client.tls_set_context(tls_context)
 
@@ -256,6 +254,10 @@ class CameraStreamer:
         if self.source is None:
             log.error("Camera source not ready — cannot handle offer (session=%s)", session_id)
             return
+
+        if session_id in self._active_peers:
+            log.warning("Session %s already active — closing stale connection", session_id)
+            await self._close_peer_session(session_id)
 
         peer_connection = RTCPeerConnection(
             configuration=RTCConfiguration(iceServers=ice_servers)

@@ -172,7 +172,9 @@ class CameraSource:
         frame_interval = 1 / self.fps if self.fps > 0 else 0
 
         while self._is_running:
-            ret, raw_frame = self.cap.read()
+            loop_start = time.monotonic()
+            # cap.read() blocks waiting for hardware — run in thread to keep event loop free.
+            ret, raw_frame = await asyncio.to_thread(self.cap.read)
             if not ret:
                 await asyncio.sleep(0.05)
                 continue
@@ -237,7 +239,9 @@ class CameraSource:
                 self._frame_sequence  += 1
                 self._frame_condition.notify_all()
 
-            await asyncio.sleep(frame_interval)
+            elapsed    = time.monotonic() - loop_start
+            sleep_time = max(0.0, frame_interval - elapsed)
+            await asyncio.sleep(sleep_time)
 
     async def get_next_frame(self, last_known_sequence: int) -> tuple[int, np.ndarray, float]:
         """Wait until a frame newer than last_known_sequence is available.

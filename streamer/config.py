@@ -68,7 +68,7 @@ MQTT_KEEPALIVE = 60     # seconds between keepalive pings
 
 # Anedya Root CA 3 (ECC-256) — https://docs.anedya.io/device/mqtt-endpoints/#tls
 # Embedded here so the device works without an extra file on disk.
-ANEDYA_CA_CERT = """\
+ANEDYA_CA_CERT = """
 -----BEGIN CERTIFICATE-----
 MIICDDCCAbOgAwIBAgITQxd3Dqj4u/74GrImxc0M4EbUvDAKBggqhkjOPQQDAjBL
 MQswCQYDVQQGEwJJTjEQMA4GA1UECBMHR3VqYXJhdDEPMA0GA1UEChMGQW5lZHlh
