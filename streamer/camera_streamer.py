@@ -141,7 +141,10 @@ class CameraStreamer:
         )
 
         log.info("Connecting to Anedya MQTT broker %s:%d...", MQTT_BROKER, MQTT_PORT)
-        client.connect(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
+        # connect_async() returns immediately; loop_start()'s background thread
+        # handles DNS resolution and the TCP/TLS handshake without blocking the
+        # asyncio event loop.
+        client.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
         # loop_start() spins the MQTT network I/O in a daemon thread.
         # All paho callbacks (_on_connect, _on_message, etc.) run in that thread,
         # NOT in the asyncio event loop thread — keep that distinction in mind.
@@ -350,9 +353,10 @@ class CameraStreamer:
             try:
                 await asyncio.wait_for(ice_gathering_done.wait(), timeout=15)
             except asyncio.TimeoutError:
-                log.error("ICE gathering timed out (session=%s)", session_id)
-                await self._close_peer_session(session_id)
-                return
+                log.warning(
+                    "ICE gathering timed out (session=%s) — proceeding with available candidates",
+                    session_id,
+                )
 
         answer_payload = json.dumps({
             "sdp":  peer_connection.localDescription.sdp,
