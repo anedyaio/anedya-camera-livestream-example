@@ -167,6 +167,56 @@ class CameraSource:
             self._is_running   = True
             self._capture_task = asyncio.create_task(self._capture_loop())
 
+    def _process_raw_frame(self, raw_frame: np.ndarray) -> tuple[np.ndarray, float]:
+        """Motion detection + annotation. Runs in a thread via asyncio.to_thread."""
+        analysis_frame = cv2.resize(raw_frame, (self.analysis_width, self.analysis_height))
+
+        # Use only the lower half of the frame for motion detection.
+        # The upper half often contains sky or ceiling whose brightness changes
+        # due to lighting conditions, causing false-positive motion events.
+        roi_y_start = self.analysis_height // 2
+        roi         = analysis_frame[roi_y_start:self.analysis_height, 0:self.analysis_width]
+
+        gray   = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+        mask   = self._background_subtractor.apply(gray)
+        # Threshold the raw subtractor output to a clean binary mask.
+        # Values below 200 are uncertain background; keep only high-confidence foreground.
+        _, binary_mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
+
+        # Morphological open removes isolated noise pixels (salt-and-pepper)
+        # that would otherwise produce tiny spurious contours.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        # 1200 px² threshold on the downscaled analysis frame filters out small
+        # noise blobs. Adjust this value to tune sensitivity (lower = more sensitive).
+        motion_contours = [c for c in contours if cv2.contourArea(c) > 1200]
+
+        now = time.time()
+
+        if motion_contours:
+            if now - self._last_motion_trigger > self._motion_cooldown:
+                log.info("Motion detected")
+                self._last_motion_trigger = now
+
+            # Scale bounding boxes back from analysis-ROI coordinates to
+            # full-resolution frame coordinates before drawing.
+            scale_x      = raw_frame.shape[1] / self.analysis_width
+            scale_y      = raw_frame.shape[0] / self.analysis_height
+            roi_y_offset = self.analysis_height // 2
+
+            for contour in motion_contours:
+                x, y, w, h = cv2.boundingRect(contour)
+                x1 = int(x * scale_x)
+                y1 = int((y + roi_y_offset) * scale_y)
+                x2 = int((x + w) * scale_x)
+                y2 = int((y + h + roi_y_offset) * scale_y)
+                cv2.rectangle(raw_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        return draw_timestamp(raw_frame, now), now
+
     async def _capture_loop(self) -> None:
         """Main capture loop: read → analyse → annotate → record → publish."""
         frame_interval = 1 / self.fps if self.fps > 0 else 0
@@ -179,55 +229,8 @@ class CameraSource:
                 await asyncio.sleep(0.05)
                 continue
 
-            # Downscale once for motion analysis to keep CPU usage low on Pi.
-            analysis_frame = cv2.resize(raw_frame, (self.analysis_width, self.analysis_height))
-
-            # Use only the lower half of the frame for motion detection.
-            # The upper half often contains sky or ceiling whose brightness changes
-            # due to lighting conditions, causing false-positive motion events.
-            roi_y_start = self.analysis_height // 2
-            roi         = analysis_frame[roi_y_start:self.analysis_height, 0:self.analysis_width]
-
-            gray   = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (3, 3), 0)
-            mask   = self._background_subtractor.apply(gray)
-            # Threshold the raw subtractor output to a clean binary mask.
-            # Values below 200 are uncertain background; keep only high-confidence foreground.
-            _, binary_mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
-
-            # Morphological open removes isolated noise pixels (salt-and-pepper)
-            # that would otherwise produce tiny spurious contours.
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-            binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
-
-            contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            # 1200 px² threshold on the downscaled analysis frame filters out small
-            # noise blobs. Adjust this value to tune sensitivity (lower = more sensitive).
-            motion_contours = [c for c in contours if cv2.contourArea(c) > 1200]
-            motion_detected = len(motion_contours) > 0
-
-            now = time.time()
-
-            if motion_detected:
-                if now - self._last_motion_trigger > self._motion_cooldown:
-                    log.info("Motion detected")
-                    self._last_motion_trigger = now
-
-                # Scale bounding boxes back from analysis-ROI coordinates to
-                # full-resolution frame coordinates before drawing.
-                scale_x      = raw_frame.shape[1] / self.analysis_width
-                scale_y      = raw_frame.shape[0] / self.analysis_height
-                roi_y_offset = self.analysis_height // 2
-
-                for contour in motion_contours:
-                    x, y, w, h = cv2.boundingRect(contour)
-                    x1 = int(x * scale_x)
-                    y1 = int((y + roi_y_offset) * scale_y)
-                    x2 = int((x + w) * scale_x)
-                    y2 = int((y + h + roi_y_offset) * scale_y)
-                    cv2.rectangle(raw_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-
-            annotated_frame = draw_timestamp(raw_frame, now)
+            # CPU-intensive OpenCV processing runs in a thread to keep event loop free.
+            annotated_frame, now = await asyncio.to_thread(self._process_raw_frame, raw_frame)
 
             # copy() so the recorder and the Condition share independent buffers —
             # if the live viewer modifies the frame later it won't corrupt the recording.

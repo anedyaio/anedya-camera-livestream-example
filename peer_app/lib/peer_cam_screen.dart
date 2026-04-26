@@ -380,13 +380,25 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     // Step 3: create the SDP offer and wait for ICE candidate gathering.
     try {
       _safeSetState(() => _statusText = 'Gathering ICE...');
+
+      // Register BEFORE setLocalDescription — gathering can complete near-instantly
+      // on some platforms and the event fires before we could register after.
+      final iceCompleter = Completer<void>();
+      _peerConnection!.onIceGatheringState = (RTCIceGatheringState state) {
+        if (state == RTCIceGatheringState.RTCIceGatheringStateComplete &&
+            !iceCompleter.isCompleted) {
+          iceCompleter.complete();
+        }
+      };
+
       final offer = await _peerConnection!.createOffer();
       await _peerConnection!.setLocalDescription(offer);
 
-      // ICE gathering state-change callbacks are unreliable on some platforms,
-      // so a fixed 2-second wait is used. This is sufficient for local and
-      // STUN-derived candidates to be gathered on most networks.
-      await Future.delayed(const Duration(seconds: 2));
+      try {
+        await iceCompleter.future.timeout(const Duration(seconds: 8));
+      } on TimeoutException {
+        _appendLog('ICE gathering timed out — proceeding with available candidates');
+      }
 
       final localDescription = await _peerConnection!.getLocalDescription();
       if (localDescription == null) throw Exception('Local description is null');
