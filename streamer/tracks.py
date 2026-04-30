@@ -16,7 +16,6 @@ import logging
 import av
 import cv2
 import numpy as np
-import sounddevice as sd
 from aiortc import AudioStreamTrack, VideoStreamTrack
 
 from camera import CameraSource
@@ -190,6 +189,14 @@ class MicrophoneAudioTrack(AudioStreamTrack):
         self._audio_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=50)
         self._event_loop  = asyncio.get_event_loop()
         self._pts         = 0
+
+        try:
+            import sounddevice as sd
+        except (ImportError, OSError) as exc:
+            raise RuntimeError(
+                "Microphone audio requires PortAudio. Install it with "
+                "`sudo apt install libportaudio2`, or run with `--no-audio`."
+            ) from exc
 
         self._input_stream = sd.InputStream(
             samplerate = AUDIO_SAMPLE_RATE,

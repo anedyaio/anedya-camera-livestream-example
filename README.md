@@ -172,6 +172,16 @@ cd streamer
 uv sync
 ```
 
+If you want microphone audio on Raspberry Pi OS or Debian, install the system
+PortAudio runtime before starting the streamer:
+
+```bash
+sudo apt install libportaudio2
+```
+
+This is only required for audio. Video-only mode works without PortAudio by
+running the streamer with `--no-audio`.
+
 ---
 
 ### Step 4: Run the Streamer
