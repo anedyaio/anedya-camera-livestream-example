@@ -87,6 +87,8 @@ TOPIC_VALUESTORE_UPDATES = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/update
 TOPIC_VALUESTORE_SET     = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/setValue/json"
 TOPIC_RESPONSES          = f"$anedya/device/{ANEDYA_DEVICE_ID}/response"
 TOPIC_ERRORS             = f"$anedya/device/{ANEDYA_DEVICE_ID}/errors"
+TOPIC_HEARTBEAT          = f"$anedya/device/{ANEDYA_DEVICE_ID}/heartbeat/json"
+HEARTBEAT_INTERVAL_SECONDS = MQTT_KEEPALIVE
 
 AUDIO_SAMPLE_RATE   = 48000  # Hz — standard WebRTC audio sample rate
 AUDIO_CHANNELS      = 1      # mono

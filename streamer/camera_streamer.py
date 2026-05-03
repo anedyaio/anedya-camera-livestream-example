@@ -40,9 +40,12 @@ from config import (
     TOPIC_RESPONSES,
     TOPIC_VALUESTORE_SET,
     TOPIC_VALUESTORE_UPDATES,
+    TOPIC_HEARTBEAT,
+    HEARTBEAT_INTERVAL_SECONDS,
 )
 from recording import RecordingManager
 from tracks import MicrophoneAudioTrack, WebcamTrack
+from concurrent.futures import Future
 
 log = logging.getLogger("streamer")
 
@@ -108,6 +111,23 @@ class CameraStreamer:
         self.recorder = RecordingManager(record_path=record_path)
         self.source:   CameraSource | None = None
 
+        self._heartbeat_task: Future | None = None
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodically publish device heartbeat to Anedya."""
+        while True:
+            if self._mqtt_client:
+                try:
+                    result = self._mqtt_client.publish(TOPIC_HEARTBEAT, json.dumps({}), qos=1)
+                    if result.rc != mqtt_lib.MQTT_ERR_SUCCESS:
+                        log.warning("Heartbeat publish failed rc=%s", result.rc)
+                    else:
+                        log.debug("Heartbeat published")
+                except Exception as e:
+                    log.warning("Heartbeat failed: %s", e)
+
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
     def _connect_to_mqtt_broker(self) -> None:
         """Create, configure, and start the Paho MQTT client.
 
@@ -157,6 +177,16 @@ class CameraStreamer:
             client.subscribe(TOPIC_VALUESTORE_UPDATES)
             client.subscribe(TOPIC_RESPONSES)
             client.subscribe(TOPIC_ERRORS)
+
+            # Start heartbeat once connection is live
+            if (
+                self._heartbeat_task is None
+                or self._heartbeat_task.done()
+            ) and self._event_loop:
+                self._heartbeat_task = asyncio.run_coroutine_threadsafe(
+                    self._heartbeat_loop(),
+                    self._event_loop
+                )
         else:
             reason = self._MQTT_RETURN_CODES.get(rc, f"unknown (rc={rc})")
             log.error("MQTT connection refused: %s — check credentials", reason)
@@ -407,6 +437,10 @@ class CameraStreamer:
             self.source = None
 
         self.recorder.stop()
+
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
+            self._heartbeat_task = None
 
         if self._mqtt_client:
             self._mqtt_client.loop_stop()
