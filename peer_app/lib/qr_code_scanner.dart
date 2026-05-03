@@ -55,9 +55,10 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                         final data = jsonDecode(raw);
                         final nodeId = data['node_id']?.toString();
                         if (nodeId != null && nodeId.isNotEmpty) {
+                          final navigator = Navigator.of(context);
                           await _scanner.stop();
                           widget.onNodeIdScanned(nodeId);
-                          if (mounted) Navigator.pop(context);
+                          if (mounted) navigator.pop();
                         }
                       } catch (_) {}
                     },
@@ -69,7 +70,11 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
               padding: EdgeInsets.symmetric(vertical: 8),
               child: Text(
                 'OR ENTER MANUALLY',
-                style: TextStyle(color: Color(0x80EEEEEE), fontSize: 12, letterSpacing: 1.2),
+                style: TextStyle(
+                  color: Color(0x80EEEEEE),
+                  fontSize: 12,
+                  letterSpacing: 1.2,
+                ),
               ),
             ),
             Padding(
@@ -100,7 +105,9 @@ class _QRScannerScreenState extends State<QRScannerScreen> {
                         backgroundColor: const Color(0xFF2563EB),
                         foregroundColor: Colors.white,
                         minimumSize: const Size(0, 48),
-                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                        ),
                         elevation: 0,
                       ),
                       child: const Text(

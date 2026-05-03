@@ -26,10 +26,10 @@ class PeerCamScreen extends StatefulWidget {
 }
 
 class _PeerCamScreenState extends State<PeerCamScreen> {
-
   String _nodeId = ''; // Anedya Node ID of the Pi camera device
   String _apiKey = ''; // Anedya Platform API key
-  bool _forceRelayOnly = false; // when true, forces WebRTC to use TURN relay only
+  bool _forceRelayOnly =
+      false; // when true, forces WebRTC to use TURN relay only
 
   late TextEditingController _nodeIdController;
   late TextEditingController _apiKeyController;
@@ -39,6 +39,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   bool _isStreamActive = false;
   bool _isInErrorState = false;
   String _statusText = 'Ready - press Start';
+  String _networkModeText = 'Mode: --';
+  bool _isTurnMode = false;
   String _logOutput = '';
 
   // WebRTC objects
@@ -106,7 +108,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     if (!_isDisposed && mounted) setState(fn);
   }
 
-  void _appendLog(String message) => _safeSetState(() => _logOutput += '$message\n');
+  void _appendLog(String message) =>
+      _safeSetState(() => _logOutput += '$message\n');
 
   // HTTP headers
   Map<String, String> get _requestHeaders => {
@@ -116,7 +119,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   };
 
   // ValueStore namespace scopes all keys to this specific Pi node.
-  Map<String, dynamic> get _valueStoreNamespace => {'scope': 'node', 'id': _nodeId};
+  Map<String, dynamic> get _valueStoreNamespace => {
+    'scope': 'node',
+    'id': _nodeId,
+  };
 
   /// Writes [value] under [key] in this node's ValueStore.
   /// Used to publish the SDP offer so the Pi can read it over MQTT.
@@ -132,7 +138,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       }),
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      throw Exception('ValueStore write failed: ${response.statusCode} ${response.body}');
+      throw Exception(
+        'ValueStore write failed: ${response.statusCode} ${response.body}',
+      );
     }
   }
 
@@ -168,7 +176,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     }
     final decoded = jsonDecode(response.body);
     if (decoded is! Map<String, dynamic> || decoded['relayData'] is! Map) {
-      throw Exception(decoded['error']?.toString() ?? 'No relayData in response');
+      throw Exception(
+        decoded['error']?.toString() ?? 'No relayData in response',
+      );
     }
     final relayData = Map<String, dynamic>.from(decoded['relayData'] as Map);
     // flutter_webrtc expects the field named 'password'; Anedya returns it as 'credential'.
@@ -186,7 +196,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   ///   { cmd: 'live' }               — return to live (streaming) mode
   void _sendDataChannelCommand(Map<String, dynamic> command) {
     final channel = _dataChannel;
-    if (channel != null && channel.state == RTCDataChannelState.RTCDataChannelOpen) {
+    if (channel != null &&
+        channel.state == RTCDataChannelState.RTCDataChannelOpen) {
       channel.send(RTCDataChannelMessage(jsonEncode(command)));
     }
   }
@@ -216,7 +227,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       }
 
       _currentTimeLabel = _formatDuration(_currentPositionSeconds);
-      _totalDurationLabel = totalDuration > 0 ? _formatDuration(totalDuration) : 'LIVE';
+      _totalDurationLabel = totalDuration > 0
+          ? _formatDuration(totalDuration)
+          : 'LIVE';
 
       if (totalDuration <= 0) {
         // No segments finalized yet — recording just started.
@@ -230,8 +243,12 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         _timelineStatusText = 'Live mode';
         _showGoLiveButton = false;
       } else {
-        final secondsBehindLive = (totalDuration - playbackPosition).clamp(0.0, double.infinity);
-        _timelineStatusText = 'Playback mode - ${_formatDuration(secondsBehindLive)} behind live';
+        final secondsBehindLive = (totalDuration - playbackPosition).clamp(
+          0.0,
+          double.infinity,
+        );
+        _timelineStatusText =
+            'Playback mode - ${_formatDuration(secondsBehindLive)} behind live';
         // Show Go Live button so the user can return to the live edge.
         _showGoLiveButton = true;
       }
@@ -279,6 +296,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
 
     _safeSetState(() {
       _statusText = 'Fetching TURN credentials...';
+      _networkModeText = 'Mode: --';
+      _isTurnMode = false;
       _isStreamActive = true;
       _isInErrorState = false;
     });
@@ -306,7 +325,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         'iceTransportPolicy': _forceRelayOnly ? 'relay' : 'all',
         'iceServers': [
           {
-            'urls': ['stun:turn1.ap-in-1.anedya.io:3478', 'turn:turn1.ap-in-1.anedya.io:3478'],
+            'urls': [
+              'stun:turn1.ap-in-1.anedya.io:3478',
+              'turn:turn1.ap-in-1.anedya.io:3478',
+            ],
             'username': turnCredentials['username'],
             'credential': turnCredentials['password'],
           },
@@ -316,7 +338,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       // Data channel must be created before the offer so its m-line is included
       // in the SDP. Ordered delivery ensures commands arrive in sequence.
       final dataChannelConfig = RTCDataChannelInit()..ordered = true;
-      _dataChannel = await _peerConnection!.createDataChannel('control', dataChannelConfig);
+      _dataChannel = await _peerConnection!.createDataChannel(
+        'control',
+        dataChannelConfig,
+      );
 
       _dataChannel!.onDataChannelState = (state) {
         if (state == RTCDataChannelState.RTCDataChannelOpen) {
@@ -364,9 +389,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
 
       _peerConnection!.onConnectionState = (connectionState) async {
         _appendLog('PC state: ${connectionState.name}');
-        if (connectionState == RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
+        if (connectionState ==
+            RTCPeerConnectionState.RTCPeerConnectionStateConnected) {
           await _logConnectionType();
-        } else if (connectionState == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+        } else if (connectionState ==
+            RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
           _handleError('Connection failed');
           stopStream(logStop: false);
         }
@@ -397,11 +424,15 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       try {
         await iceCompleter.future.timeout(const Duration(seconds: 8));
       } on TimeoutException {
-        _appendLog('ICE gathering timed out — proceeding with available candidates');
+        _appendLog(
+          'ICE gathering timed out — proceeding with available candidates',
+        );
       }
 
       final localDescription = await _peerConnection!.getLocalDescription();
-      if (localDescription == null) throw Exception('Local description is null');
+      if (localDescription == null) {
+        throw Exception('Local description is null');
+      }
 
       // Step 4: write the offer + TURN credentials to ValueStore.
       // The Pi receives this as an MQTT notification and begins its answer flow.
@@ -434,7 +465,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   /// the WebRTC handshake and allow media to flow.
   void _startPollingForAnswer(String answerKey) {
     int pollAttempts = 0;
-    _answerPollTimer = Timer.periodic(const Duration(seconds: 2), (timer) async {
+    _answerPollTimer = Timer.periodic(const Duration(seconds: 2), (
+      timer,
+    ) async {
       pollAttempts++;
       if (pollAttempts > 30) {
         timer.cancel();
@@ -445,12 +478,17 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       }
       try {
         final answerPayload = await _readFromValueStore(answerKey);
-        if (answerPayload == null) return; // not written yet — try again next tick
+        if (answerPayload == null) {
+          return; // not written yet — try again next tick
+        }
         timer.cancel();
         _answerPollTimer = null;
         final answerSdp = jsonDecode(answerPayload) as Map<String, dynamic>;
         await _peerConnection?.setRemoteDescription(
-          RTCSessionDescription(answerSdp['sdp'] as String, answerSdp['type'] as String),
+          RTCSessionDescription(
+            answerSdp['sdp'] as String,
+            answerSdp['type'] as String,
+          ),
         );
         _appendLog('Answer applied - WebRTC connecting...');
       } catch (error) {
@@ -474,6 +512,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     if (logStop) _appendLog('Stream stopped');
     _safeSetState(() {
       _statusText = 'Ready - press Start';
+      _networkModeText = 'Mode: --';
+      _isTurnMode = false;
       _isStreamActive = false;
       _isInErrorState = false;
     });
@@ -502,7 +542,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         if (report.type != 'candidate-pair') continue;
         if (report.values['state']?.toString() != 'succeeded') continue;
         final localCandidateId = report.values['localCandidateId']?.toString();
-        final remoteCandidateId = report.values['remoteCandidateId']?.toString();
+        final remoteCandidateId = report.values['remoteCandidateId']
+            ?.toString();
         final localCandidateType = localCandidateId == null
             ? null
             : statsById[localCandidateId]?.values['candidateType']?.toString();
@@ -514,6 +555,12 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
               ? 'Candidate type: TURN (relayed)'
               : 'Candidate type: P2P (direct)',
         );
+        final isTurn =
+            localCandidateType == 'relay' || remoteCandidateType == 'relay';
+        _safeSetState(() {
+          _isTurnMode = isTurn;
+          _networkModeText = isTurn ? 'Mode: TURN' : 'Mode: P2P';
+        });
         return;
       }
     } catch (error) {
@@ -524,7 +571,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   void _handleError(String message) {
     _appendLog(message);
     _safeSetState(() {
-      _statusText = message.startsWith('Connection failed') ? 'Connection failed' : 'Error';
+      _statusText = message.startsWith('Connection failed')
+          ? 'Connection failed'
+          : 'Error';
       _isInErrorState = true;
       _isStreamActive = false;
     });
@@ -541,14 +590,28 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   // Status badge colors
   Color get _statusBackgroundColor {
     if (_isInErrorState) return const Color(0xFF450A0A);
-    if (_isStreamActive || _statusText.startsWith('Ready')) return const Color(0xFF14532D);
+    if (_isStreamActive || _statusText.startsWith('Ready')) {
+      return const Color(0xFF14532D);
+    }
     return const Color(0xFF222222);
   }
 
   Color get _statusTextColor {
     if (_isInErrorState) return const Color(0xFFF87171);
-    if (_isStreamActive || _statusText.startsWith('Ready')) return const Color(0xFF4ADE80);
+    if (_isStreamActive || _statusText.startsWith('Ready')) {
+      return const Color(0xFF4ADE80);
+    }
     return const Color(0xFFEEEEEE);
+  }
+
+  Color get _networkModeBackgroundColor {
+    if (_networkModeText == 'Mode: --') return const Color(0xFF222222);
+    return _isTurnMode ? const Color(0xFF3B2F0A) : const Color(0xFF0F3A2E);
+  }
+
+  Color get _networkModeTextColor {
+    if (_networkModeText == 'Mode: --') return const Color(0xFFAAAAAA);
+    return _isTurnMode ? const Color(0xFFFACC15) : const Color(0xFF34D399);
   }
 
   @override
@@ -567,6 +630,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
                   _buildHeader(),
                   const SizedBox(height: 8),
                   _buildStatusBadge(),
+                  const SizedBox(height: 8),
+                  _buildNetworkModeBadge(),
                   const SizedBox(height: 16),
                   _buildVideoView(),
                   const SizedBox(height: 8),
@@ -579,7 +644,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
                     const SizedBox(height: 8),
                     _buildSettingsPanel(),
                   ],
-                  if (_showTimelinePanel) ...[const SizedBox(height: 8), _buildTimelinePanel()],
+                  if (_showTimelinePanel) ...[
+                    const SizedBox(height: 8),
+                    _buildTimelinePanel(),
+                  ],
                   const SizedBox(height: 8),
                   _buildLogOutput(),
                 ],
@@ -597,7 +665,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       children: [
         const Text(
           'PI CAM',
-          style: TextStyle(color: Color(0xFFEEEEEE), fontSize: 19, letterSpacing: 0.95),
+          style: TextStyle(
+            color: Color(0xFFEEEEEE),
+            fontSize: 19,
+            letterSpacing: 0.95,
+          ),
         ),
         // QR icon opens the scanner. The streamer prints a QR payload on startup
         // that encodes the node_id — scan it instead of typing the UUID manually.
@@ -633,8 +705,24 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         borderRadius: BorderRadius.circular(999),
       ),
       child: Text(
-        _nodeId.isNotEmpty ? _statusText : 'No device configured — tap Settings',
+        _nodeId.isNotEmpty
+            ? _statusText
+            : 'No device configured — tap Settings',
         style: TextStyle(color: _statusTextColor, fontSize: 13.6),
+      ),
+    );
+  }
+
+  Widget _buildNetworkModeBadge() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: _networkModeBackgroundColor,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        _networkModeText,
+        style: TextStyle(color: _networkModeTextColor, fontSize: 12.8),
       ),
     );
   }
@@ -666,7 +754,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     return Align(
       alignment: Alignment.centerRight,
       child: TextButton(
-        onPressed: () => _safeSetState(() => _isSettingsPanelVisible = !_isSettingsPanelVisible),
+        onPressed: () => _safeSetState(
+          () => _isSettingsPanelVisible = !_isSettingsPanelVisible,
+        ),
         style: TextButton.styleFrom(
           backgroundColor: const Color(0xFF374151),
           foregroundColor: Colors.white,
@@ -688,7 +778,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
               child: _buildButton(
                 label: 'Start Stream',
                 color: const Color(0xFF2563EB),
-                onPressed: (!hasDeviceConfigured || _isStreamActive) ? null : _startStream,
+                onPressed: (!hasDeviceConfigured || _isStreamActive)
+                    ? null
+                    : _startStream,
               ),
             ),
             const SizedBox(width: 12),
@@ -696,7 +788,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
               child: _buildButton(
                 label: 'Stop Stream',
                 color: const Color(0xFFDC2626),
-                onPressed: (!hasDeviceConfigured || !_isStreamActive) ? null : () => stopStream(),
+                onPressed: (!hasDeviceConfigured || !_isStreamActive)
+                    ? null
+                    : () => stopStream(),
               ),
             ),
           ],
@@ -773,7 +867,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         children: [
           const Text(
             'SETTINGS',
-            style: TextStyle(color: Color(0x99EEEEEE), fontSize: 14, letterSpacing: 0.8),
+            style: TextStyle(
+              color: Color(0x99EEEEEE),
+              fontSize: 14,
+              letterSpacing: 0.8,
+            ),
           ),
           const SizedBox(height: 14),
           _buildInputField(
@@ -805,7 +903,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
                 backgroundColor: const Color(0xFF374151),
                 foregroundColor: Colors.white,
                 minimumSize: const Size(0, 44),
-                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(8),
+                ),
                 elevation: 0,
               ),
               child: const Text('Save Settings'),
@@ -815,7 +915,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           const Text(
             'Node ID and API key are stored on this device via SharedPreferences. '
             'Enter the raw API key — Bearer is added automatically.',
-            style: TextStyle(color: Color(0x80EEEEEE), fontSize: 12, height: 1.5),
+            style: TextStyle(
+              color: Color(0x80EEEEEE),
+              fontSize: 12,
+              height: 1.5,
+            ),
           ),
         ],
       ),
@@ -831,7 +935,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(color: Color(0xBFEEEEEE), fontSize: 13)),
+        Text(
+          label,
+          style: const TextStyle(color: Color(0xBFEEEEEE), fontSize: 13),
+        ),
         const SizedBox(height: 6),
         TextField(
           controller: controller,
@@ -850,7 +957,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
               borderRadius: BorderRadius.circular(8),
               borderSide: const BorderSide(color: Color(0xFF2D2D2D)),
             ),
-            contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 12,
+              vertical: 12,
+            ),
           ),
         ),
       ],
@@ -902,8 +1012,13 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
                 ? (selectedPosition) {
                     _safeSetState(() => _isUserScrubbing = false);
                     // Tell the Pi to jump to this position in the recording.
-                    _sendDataChannelCommand({'cmd': 'seek', 'offset': selectedPosition});
-                    _appendLog('Seeking to ${_formatDuration(selectedPosition)}');
+                    _sendDataChannelCommand({
+                      'cmd': 'seek',
+                      'offset': selectedPosition,
+                    });
+                    _appendLog(
+                      'Seeking to ${_formatDuration(selectedPosition)}',
+                    );
                   }
                 : null,
             activeColor: const Color(0xFF2563EB),
@@ -926,7 +1041,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       alignment: Alignment.centerLeft,
       child: Text(
         _logOutput,
-        style: const TextStyle(color: Color(0x80EEEEEE), fontSize: 12, height: 1.6),
+        style: const TextStyle(
+          color: Color(0x80EEEEEE),
+          fontSize: 12,
+          height: 1.6,
+        ),
       ),
     );
   }

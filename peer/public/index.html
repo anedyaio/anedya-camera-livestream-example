@@ -42,6 +42,24 @@
       color: #4ade80;
     }
 
+    #networkMode {
+      font-size: 0.8rem;
+      padding: 0.35rem 0.7rem;
+      border-radius: 999px;
+      background: #222;
+      color: #aaa;
+    }
+
+    #networkMode.turn {
+      background: #3b2f0a;
+      color: #facc15;
+    }
+
+    #networkMode.p2p {
+      background: #0f3a2e;
+      color: #34d399;
+    }
+
     #status.error {
       background: #450a0a;
       color: #f87171;
@@ -211,6 +229,7 @@
 <body>
   <h1>PI CAM</h1>
   <div id="status">Connecting...</div>
+  <div id="networkMode">Mode: --</div>
   <video id="video" autoplay playsinline></video>
 
   <div class="toolbar">
@@ -269,6 +288,7 @@
 
     // UI references.
     const statusEl = document.getElementById('status');
+    const networkModeEl = document.getElementById('networkMode');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
     const liveBtn = document.getElementById('liveBtn');
@@ -353,6 +373,8 @@
 
     function resetUI() {
       video.srcObject = null;
+      networkModeEl.textContent = 'Mode: --';
+      networkModeEl.className = '';
       startBtn.disabled = false;
       stopBtn.disabled = true;
       liveBtn.style.display = 'none';
@@ -415,6 +437,11 @@
         timelineStatus.textContent = `Playback mode - ${formatTime(behindLive)} behind live`;
         liveBtn.style.display = 'inline-block';
       }
+    }
+
+    function setNetworkMode(mode) {
+      networkModeEl.textContent = `Mode: ${mode}`;
+      networkModeEl.className = mode === 'TURN' ? 'turn' : mode === 'P2P' ? 'p2p' : '';
     }
 
     // Data channel controls only the device-side playback mode.
@@ -615,8 +642,10 @@
               const remote = stats.get(report.remoteCandidateId);
               if (local?.candidateType === 'relay' || remote?.candidateType === 'relay') {
                 uiLog('Candidate type: TURN');
+                setNetworkMode('TURN');
               } else {
                 uiLog('Candidate type: P2P');
+                setNetworkMode('P2P');
               }
             }
           });

@@ -44,7 +44,7 @@ from config import (
     HEARTBEAT_INTERVAL_SECONDS,
 )
 from recording import RecordingManager
-from tracks import MicrophoneAudioTrack, WebcamTrack
+from tracks import MicrophoneAudioTrack, MicrophoneSource, WebcamTrack
 from concurrent.futures import Future
 
 log = logging.getLogger("streamer")
@@ -110,6 +110,7 @@ class CameraStreamer:
 
         self.recorder = RecordingManager(record_path=record_path)
         self.source:   CameraSource | None = None
+        self.audio_source: MicrophoneSource | None = None
 
         self._heartbeat_task: Future | None = None
 
@@ -296,7 +297,11 @@ class CameraStreamer:
             configuration=RTCConfiguration(iceServers=ice_servers)
         )
         video_track = WebcamTrack(self.source, self.recorder)
-        audio_track = MicrophoneAudioTrack() if self.enable_audio else None
+        audio_track = (
+            MicrophoneAudioTrack(self.audio_source)
+            if self.enable_audio and self.audio_source
+            else None
+        )
 
         self._active_peers[session_id] = {
             "pc":    peer_connection,
@@ -417,9 +422,19 @@ class CameraStreamer:
         asyncio.create_task(self.recorder.run())
         await self.recorder.wait_until_ready()
 
-        self.source = CameraSource(self.camera_index, self.recorder)
-        await self.source.start()
+        source = CameraSource(self.camera_index, self.recorder)
+        await source.start()
 
+        if self.enable_audio:
+            try:
+                self.audio_source = MicrophoneSource()
+                self.audio_source.start()
+            except Exception as exc:
+                self.enable_audio = False
+                self.audio_source = None
+                log.warning("Audio disabled: %s", exc)
+
+        self.source = source
         log.info("Streamer running — recording started, waiting for peers")
         try:
             while True:
@@ -435,6 +450,10 @@ class CameraStreamer:
         if self.source:
             await self.source.stop()
             self.source = None
+
+        if self.audio_source:
+            self.audio_source.release()
+            self.audio_source = None
 
         self.recorder.stop()
 

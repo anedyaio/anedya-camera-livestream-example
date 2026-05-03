@@ -12,6 +12,7 @@ and delivers PCM samples to aiortc at the standard 48 kHz / 20 ms cadence.
 import asyncio
 import fractions
 import logging
+import time
 
 import av
 import cv2
@@ -174,21 +175,64 @@ class WebcamTrack(VideoStreamTrack):
 
 
 class MicrophoneAudioTrack(AudioStreamTrack):
-    """Live microphone audio track.
-
-    Opens the system default input device via sounddevice and pushes raw PCM
-    samples into an asyncio queue from the sounddevice callback thread.
-    aiortc calls recv() to pull one 20 ms frame at a time, which is wrapped
-    in an av.AudioFrame and delivered to the connected peer.
-    """
+    """Per-peer audio track fed by the shared microphone source."""
 
     kind = "audio"
 
-    def __init__(self):
+    def __init__(self, source: "MicrophoneSource"):
         super().__init__()
-        self._audio_queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=50)
-        self._event_loop  = asyncio.get_event_loop()
-        self._pts         = 0
+        self._source = source
+        self._subscriber_id, self._audio_queue = source.subscribe()
+        self._pts = 0
+
+    async def recv(self) -> av.AudioFrame:
+        """Deliver one 20 ms PCM frame to aiortc."""
+        frame_duration = AUDIO_FRAME_SAMPLES / AUDIO_SAMPLE_RATE
+        try:
+            pcm_data = await asyncio.wait_for(
+                self._audio_queue.get(),
+                timeout=max(0.1, frame_duration * 3),
+            )
+        except asyncio.TimeoutError:
+            pcm_data = np.zeros((AUDIO_FRAME_SAMPLES, AUDIO_CHANNELS), dtype=np.int16)
+
+        # sounddevice gives shape (frames, channels); av.AudioFrame expects (channels, frames).
+        audio_frame = av.AudioFrame.from_ndarray(
+            pcm_data.T.astype(np.int16),
+            format="s16",
+            layout="mono" if AUDIO_CHANNELS == 1 else "stereo",
+        )
+        audio_frame.pts         = self._pts
+        audio_frame.sample_rate = AUDIO_SAMPLE_RATE
+        audio_frame.time_base   = fractions.Fraction(1, AUDIO_SAMPLE_RATE)
+        self._pts += AUDIO_FRAME_SAMPLES
+        return audio_frame
+
+    def release(self) -> None:
+        """Detach this peer from the shared microphone source."""
+        self._source.unsubscribe(self._subscriber_id)
+        self.stop()
+
+
+class MicrophoneSource:
+    """Single system microphone capture with per-peer fan-out queues.
+
+    PortAudio cannot reliably handle one input stream per WebRTC peer. One
+    shared input stream keeps capture load constant while each peer gets its own
+    small queue.
+    """
+
+    def __init__(self):
+        self._event_loop = asyncio.get_event_loop()
+        self._subscribers: dict[int, asyncio.Queue[np.ndarray]] = {}
+        self._next_subscriber_id = 1
+        self._input_stream = None
+        self._last_status_log_at = 0.0
+
+    def start(self) -> None:
+        """Open the system default microphone once for the whole streamer."""
+        if self._input_stream is not None:
+            return
 
         try:
             import sounddevice as sd
@@ -208,13 +252,39 @@ class MicrophoneAudioTrack(AudioStreamTrack):
         self._input_stream.start()
         log.info("Microphone opened (%d Hz, %d ch)", AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
 
-    def _enqueue_audio_samples(self, samples: np.ndarray) -> None:
-        """Push captured PCM samples into the asyncio queue (called from the sounddevice thread)."""
+    def subscribe(self) -> tuple[int, asyncio.Queue[np.ndarray]]:
+        """Create a bounded audio queue for one peer."""
+        subscriber_id = self._next_subscriber_id
+        self._next_subscriber_id += 1
+        queue: asyncio.Queue[np.ndarray] = asyncio.Queue(maxsize=10)
+        self._subscribers[subscriber_id] = queue
+        log.info("Audio subscriber added (count=%d)", len(self._subscribers))
+        return subscriber_id, queue
+
+    def unsubscribe(self, subscriber_id: int) -> None:
+        """Remove one peer audio queue."""
+        self._subscribers.pop(subscriber_id, None)
+        log.info("Audio subscriber removed (count=%d)", len(self._subscribers))
+
+    @staticmethod
+    def _put_latest(queue: asyncio.Queue[np.ndarray], samples: np.ndarray) -> None:
+        """Keep latest audio; drop stale frames when one peer falls behind."""
         try:
-            self._audio_queue.put_nowait(samples)
+            queue.put_nowait(samples)
         except asyncio.QueueFull:
-            # Drop the frame rather than block the audio capture thread.
-            pass
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                queue.put_nowait(samples)
+            except asyncio.QueueFull:
+                pass
+
+    def _fan_out_audio_samples(self, samples: np.ndarray) -> None:
+        """Push captured PCM samples to all peer queues on the asyncio loop."""
+        for queue in list(self._subscribers.values()):
+            self._put_latest(queue, samples)
 
     def _sounddevice_callback(
         self,
@@ -230,26 +300,18 @@ class MicrophoneAudioTrack(AudioStreamTrack):
         """
         _ = frames, time_info
         if status:
-            log.warning("Audio capture status: %s", status)
-        self._event_loop.call_soon_threadsafe(self._enqueue_audio_samples, indata.copy())
-
-    async def recv(self) -> av.AudioFrame:
-        """Deliver one 20 ms PCM frame to aiortc."""
-        pcm_data    = await self._audio_queue.get()
-        # sounddevice gives shape (frames, channels); av.AudioFrame expects (channels, frames).
-        audio_frame = av.AudioFrame.from_ndarray(
-            pcm_data.T.astype(np.int16),
-            format = "s16",
-            layout = "mono" if AUDIO_CHANNELS == 1 else "stereo",
-        )
-        audio_frame.pts         = self._pts
-        audio_frame.sample_rate = AUDIO_SAMPLE_RATE
-        audio_frame.time_base   = fractions.Fraction(1, AUDIO_SAMPLE_RATE)
-        self._pts += AUDIO_FRAME_SAMPLES
-        return audio_frame
+            now = time.monotonic()
+            if now - self._last_status_log_at >= 5.0:
+                log.warning("Audio capture status: %s", status)
+                self._last_status_log_at = now
+        self._event_loop.call_soon_threadsafe(self._fan_out_audio_samples, indata.copy())
 
     def release(self) -> None:
-        """Stop the microphone stream when the peer disconnects."""
+        """Stop the shared microphone stream on streamer shutdown."""
+        self._subscribers.clear()
+        if self._input_stream is None:
+            return
         self._input_stream.stop()
         self._input_stream.close()
+        self._input_stream = None
         log.info("Microphone released")
