@@ -47,9 +47,12 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   final RTCVideoRenderer _videoRenderer = RTCVideoRenderer();
   RTCPeerConnection? _peerConnection;
   RTCDataChannel? _dataChannel; // ordered channel named "control"
+  MediaStreamTrack? _audioTrack;
   Timer? _answerPollTimer; // polls ValueStore for the Pi's SDP answer
   Timer? _timelinePollTimer; // requests timeline state from Pi every 2 s
   bool _isDisposed = false;
+  bool _isMuted = false;
+  DateTime? _lastSeekTime;
 
   // Timeline state
   double _totalRecordedSeconds = 0.0; // total duration available for scrubbing
@@ -241,7 +244,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
 
       if (timelineData['mode'] == 'live') {
         _timelineStatusText = 'Live mode';
-        _showGoLiveButton = false;
+        final recentSeek = _lastSeekTime != null &&
+            DateTime.now().difference(_lastSeekTime!) <
+                const Duration(seconds: 3);
+        if (!recentSeek) _showGoLiveButton = false;
       } else {
         final secondsBehindLive = (totalDuration - playbackPosition).clamp(
           0.0,
@@ -378,6 +384,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
 
       _peerConnection!.onTrack = (trackEvent) {
         _appendLog('Got remote track: ${trackEvent.track.kind}');
+        if (trackEvent.track.kind == 'audio') {
+          _audioTrack = trackEvent.track;
+          _audioTrack!.enabled = !_isMuted;
+        }
         if (trackEvent.streams.isNotEmpty) {
           _videoRenderer.srcObject = trackEvent.streams.first;
           _safeSetState(() {
@@ -432,6 +442,16 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       final localDescription = await _peerConnection!.getLocalDescription();
       if (localDescription == null) {
         throw Exception('Local description is null');
+      }
+
+      final sdpLines = localDescription.sdp?.split('\n') ?? [];
+      final hasRelayCandidates = sdpLines.any(
+        (l) => l.trim().startsWith('a=candidate:') && l.contains('typ relay'),
+      );
+      if (!hasRelayCandidates) {
+        _appendLog(
+          'Warning: Failed to create relay candidate. Please check your quota limits.',
+        );
       }
 
       // Step 4: write the offer + TURN credentials to ValueStore.
@@ -507,6 +527,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
 
     await _closePeerConnection();
     _videoRenderer.srcObject = null;
+    _audioTrack = null;
+    _lastSeekTime = null;
     _resetTimelineState();
 
     if (logStop) _appendLog('Stream stopped');
@@ -516,6 +538,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       _isTurnMode = false;
       _isStreamActive = false;
       _isInErrorState = false;
+      _isMuted = false;
     });
   }
 
@@ -836,20 +859,44 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   }
 
   Widget _buildRelayOnlyToggle() {
-    return Row(
-      mainAxisAlignment: MainAxisAlignment.center,
+    return Wrap(
+      alignment: WrapAlignment.center,
+      spacing: 16,
       children: [
-        Checkbox(
-          value: _forceRelayOnly,
-          onChanged: (isChecked) {
-            _safeSetState(() => _forceRelayOnly = isChecked ?? false);
-            _saveSettings();
-          },
-          activeColor: const Color(0xFF2563EB),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Checkbox(
+              value: _forceRelayOnly,
+              onChanged: (isChecked) {
+                _safeSetState(() => _forceRelayOnly = isChecked ?? false);
+                _saveSettings();
+              },
+              activeColor: const Color(0xFF2563EB),
+            ),
+            const Text(
+              'Force relay/TURN only',
+              style: TextStyle(color: Color(0xFFEEEEEE), fontSize: 14),
+            ),
+          ],
         ),
-        const Text(
-          'Force relay/TURN only',
-          style: TextStyle(color: Color(0xFFEEEEEE), fontSize: 14),
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Checkbox(
+              value: _isMuted,
+              onChanged: (isChecked) {
+                final muted = isChecked ?? false;
+                _safeSetState(() => _isMuted = muted);
+                _audioTrack?.enabled = !muted;
+              },
+              activeColor: const Color(0xFF2563EB),
+            ),
+            const Text(
+              'Mute audio',
+              style: TextStyle(color: Color(0xFFEEEEEE), fontSize: 14),
+            ),
+          ],
         ),
       ],
     );
@@ -1010,8 +1057,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
                 : null,
             onChangeEnd: _totalRecordedSeconds > 0
                 ? (selectedPosition) {
-                    _safeSetState(() => _isUserScrubbing = false);
-                    // Tell the Pi to jump to this position in the recording.
+                    _lastSeekTime = DateTime.now();
+                    _safeSetState(() {
+                      _isUserScrubbing = false;
+                      _showGoLiveButton = true;
+                    });
                     _sendDataChannelCommand({
                       'cmd': 'seek',
                       'offset': selectedPosition,

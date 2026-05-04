@@ -129,6 +129,8 @@
       max-width: 640px;
       display: flex;
       justify-content: center;
+      gap: 1.5rem;
+      flex-wrap: wrap;
     }
 
     .toggle {
@@ -247,6 +249,10 @@
       <input id="relayOnlyToggle" type="checkbox" />
       <span>Force relay/TURN only</span>
     </label>
+    <label class="toggle">
+      <input id="muteToggle" type="checkbox" />
+      <span>Mute audio</span>
+    </label>
   </div>
 
   <div id="settings-panel">
@@ -294,6 +300,7 @@
     const liveBtn = document.getElementById('liveBtn');
     const settingsBtn = document.getElementById('settingsBtn');
     const relayOnlyToggle = document.getElementById('relayOnlyToggle');
+    const muteToggle = document.getElementById('muteToggle');
     const settingsPanel = document.getElementById('settings-panel');
     const nodeIdInput = document.getElementById('nodeIdInput');
     const apiKeyInput = document.getElementById('apiKeyInput');
@@ -319,6 +326,7 @@
     let pollTimer = null;
     let timelineTimer = null;
     let draggingSlider = false;
+    let lastSeekTime = 0;
 
     function uiLog(msg) {
       logEl.textContent += msg + '\n';
@@ -431,7 +439,9 @@
 
       if (msg.mode === 'live') {
         timelineStatus.textContent = 'Live mode';
-        liveBtn.style.display = 'none';
+        if (Date.now() - lastSeekTime > 3000) {
+          liveBtn.style.display = 'none';
+        }
       } else {
         const behindLive = Math.max(0, duration - position);
         timelineStatus.textContent = `Playback mode - ${formatTime(behindLive)} behind live`;
@@ -460,6 +470,8 @@
       const offset = Number(dvrSlider.value || 0);
       sendCmd({ cmd: 'seek', offset });
       uiLog(`Seeking to ${formatTime(offset)}`);
+      lastSeekTime = Date.now();
+      liveBtn.style.display = 'inline-block';
     });
 
     async function vsSet(key, value) {
@@ -545,6 +557,10 @@
 
     relayOnlyToggle.addEventListener('change', () => {
       localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
+    });
+
+    muteToggle.addEventListener('change', () => {
+      video.muted = muteToggle.checked;
     });
 
     startBtn.addEventListener('click', async () => {
@@ -668,6 +684,13 @@
           if (pc.iceGatheringState === 'complete') resolve();
         };
       });
+
+      const hasRelayCandidates = pc.localDescription.sdp.split('\n').some(
+        l => l.trim().startsWith('a=candidate:') && l.includes('typ relay')
+      );
+      if (!hasRelayCandidates) {
+        uiLog('Warning: Failed to create relay candidate. Please check your quota limits.');
+      }
 
       // Step 4: write offer + TURN data into Anedya value store.
       const sessionId = Math.random().toString(36).slice(2, 10);

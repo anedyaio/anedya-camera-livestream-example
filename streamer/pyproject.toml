@@ -22,3 +22,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
 py-modules = ["main", "camera", "camera_streamer", "config", "recording", "tracks"]
+
+[dependency-groups]
+dev = [
+    "pygrabber>=0.2",
+]
