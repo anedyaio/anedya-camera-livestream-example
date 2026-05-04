@@ -126,12 +126,14 @@ class CameraSource:
         analysis_width:  int   = MOTION_ANALYSIS_WIDTH,
         analysis_height: int   = MOTION_ANALYSIS_HEIGHT,
         fps:             float = 30.0,
+        enable_motion_detection: bool = False,
     ):
         self.camera_index    = camera_index
         self.recorder        = recorder
         self.analysis_width  = analysis_width
         self.analysis_height = analysis_height
         self.fps             = fps
+        self.enable_motion_detection = enable_motion_detection
 
         self.cap = cv2.VideoCapture(camera_index)
         if not self.cap.isOpened():
@@ -147,7 +149,11 @@ class CameraSource:
 
         # detectShadows=False improves performance and avoids shadows being
         # classified as foreground, which would cause false motion events.
-        self._background_subtractor = cv2.createBackgroundSubtractorMOG2(detectShadows=False)
+        self._background_subtractor = (
+            cv2.createBackgroundSubtractorMOG2(detectShadows=False)
+            if self.enable_motion_detection
+            else None
+        )
         self._motion_cooldown       = 5.0
         self._last_motion_trigger   = 0.0
 
@@ -169,6 +175,15 @@ class CameraSource:
 
     def _process_raw_frame(self, raw_frame: np.ndarray) -> tuple[np.ndarray, float]:
         """Motion detection + annotation. Runs in a thread via asyncio.to_thread."""
+        now = time.time()
+
+        # Return early if motion detection is disabled.
+        if not self.enable_motion_detection:
+            return draw_timestamp(raw_frame, now), now
+
+        # Assert that the background subtractor is initialized.
+        assert self._background_subtractor is not None
+        
         analysis_frame = cv2.resize(raw_frame, (self.analysis_width, self.analysis_height))
 
         # Use only the lower half of the frame for motion detection.

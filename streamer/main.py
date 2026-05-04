@@ -25,8 +25,8 @@ import logging
 
 import qrcode
 
-from config import ANEDYA_DEVICE_ID, ANEDYA_NODE_ID, validate_anedya_config
 from camera_streamer import CameraStreamer
+from config import ANEDYA_DEVICE_ID, ANEDYA_NODE_ID, validate_anedya_config
 
 log = logging.getLogger("streamer")
 
@@ -37,10 +37,12 @@ def display_qr_code() -> None:
     The peer app scans this to learn which Anedya node to connect to,
     eliminating the need to manually copy-paste UUIDs.
     """
-    payload = json.dumps({
-        "node_id":   ANEDYA_NODE_ID,
-        "device_id": ANEDYA_DEVICE_ID,
-    })
+    payload = json.dumps(
+        {
+            "node_id": ANEDYA_NODE_ID,
+            "device_id": ANEDYA_DEVICE_ID,
+        }
+    )
 
     qr = qrcode.QRCode(border=2)
     qr.add_data(payload)
@@ -51,9 +53,19 @@ def display_qr_code() -> None:
     print("\nPayload:", payload, "\n")
 
 
-async def main(camera_index: int, enable_audio: bool, record_path: str = "recordings") -> None:
+async def main(
+    camera_index: int,
+    enable_audio: bool,
+    enable_motion_detection: bool = False,
+    record_path: str = "recordings",
+) -> None:
     """Async entrypoint: run the streamer until interrupted, then shut down cleanly."""
-    streamer = CameraStreamer(camera_index, enable_audio, record_path)
+    streamer = CameraStreamer(
+        camera_index,
+        enable_audio,
+        record_path,
+        enable_motion_detection=enable_motion_detection,
+    )
     try:
         await streamer.run()
     except (KeyboardInterrupt, asyncio.CancelledError):
@@ -83,18 +95,30 @@ def cli() -> None:
         default="recordings",
         help="Directory for rolling MP4 recording segments (default: recordings)",
     )
+    parser.add_argument(
+        "--motion-detection",
+        action="store_true",
+        help="Enable OpenCV motion detection overlay/logging",
+    )
     args = parser.parse_args()
 
     log.info(
-        "Starting Pi Cam (camera=%d, audio=%s, record-path=%s)",
+        "Starting Pi Cam (camera=%d, audio=%s, motion=%s, record-path=%s)",
         args.camera,
         "off" if args.no_audio else "on",
+        "on" if args.motion_detection else "off",
         args.record_path,
     )
     validate_anedya_config()
     display_qr_code()
-    asyncio.run(main(args.camera, not args.no_audio, args.record_path))
-
+    asyncio.run(
+        main(
+            args.camera,
+            not args.no_audio,
+            enable_motion_detection=args.motion_detection,
+            record_path=args.record_path,
+        )
+    )
 
 if __name__ == "__main__":
     cli()

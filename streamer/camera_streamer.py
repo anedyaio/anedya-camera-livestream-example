@@ -100,9 +100,11 @@ class CameraStreamer:
         camera_index: int,
         enable_audio: bool = True,
         record_path:  str  = "recordings",
+        enable_motion_detection: bool = False,
     ):
         self.camera_index = camera_index
         self.enable_audio = enable_audio
+        self.enable_motion_detection = enable_motion_detection
 
         self._active_peers: dict[str, dict]              = {}
         self._event_loop:   asyncio.AbstractEventLoop | None = None
@@ -422,7 +424,11 @@ class CameraStreamer:
         asyncio.create_task(self.recorder.run())
         await self.recorder.wait_until_ready()
 
-        source = CameraSource(self.camera_index, self.recorder)
+        source = CameraSource(
+            self.camera_index,
+            self.recorder,
+            enable_motion_detection=self.enable_motion_detection,
+        )
         await source.start()
 
         if self.enable_audio:
