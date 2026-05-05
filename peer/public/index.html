@@ -325,6 +325,8 @@
     let dc = null;
     let pollTimer = null;
     let timelineTimer = null;
+    let timelineRenderTimer = null;
+    let latestTimeline = null;
     let draggingSlider = false;
     let lastSeekTime = 0;
 
@@ -381,6 +383,7 @@
 
     function resetUI() {
       video.srcObject = null;
+      latestTimeline = null;
       networkModeEl.textContent = 'Mode: --';
       networkModeEl.className = '';
       startBtn.disabled = false;
@@ -400,6 +403,7 @@
     function stopStream() {
       if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
       if (timelineTimer) { clearInterval(timelineTimer); timelineTimer = null; }
+      if (timelineRenderTimer) { clearInterval(timelineRenderTimer); timelineRenderTimer = null; }
       if (pc) { pc.close(); pc = null; }
       dc = null;
       uiLog('Stream stopped');
@@ -416,20 +420,54 @@
       }
     }
 
+    function getDisplayedTimelinePosition() {
+      if (!latestTimeline) return 0;
+      if (latestTimeline.mode === 'playback') {
+        const elapsed = (performance.now() - latestTimeline.receivedAt) / 1000;
+        return Math.min(latestTimeline.position + elapsed, latestTimeline.duration);
+      }
+      return latestTimeline.duration;
+    }
+
+    function updateTimelineDisplay() {
+      if (!latestTimeline || draggingSlider) return;
+
+      const duration = latestTimeline.duration;
+      const position = getDisplayedTimelinePosition();
+
+      dvrSlider.disabled = duration <= 0;
+      dvrSlider.max = duration;
+      dvrSlider.value = Math.min(position, duration);
+      timelineCurrent.textContent = formatTime(Number(dvrSlider.value || 0));
+      timelineEnd.textContent = duration > 0 ? formatTime(duration) : 'LIVE';
+
+      if (duration <= 0) {
+        timelineStatus.textContent = 'Recording starts immediately. Playback appears after first finalized segment.';
+      } else if (latestTimeline.mode === 'live') {
+        timelineStatus.textContent = 'Live mode';
+        if (Date.now() - lastSeekTime > 3000) {
+          liveBtn.style.display = 'none';
+        }
+      } else {
+        const behindLive = Math.max(0, duration - position);
+        timelineStatus.textContent = `Playback mode - ${formatTime(behindLive)} behind live`;
+        liveBtn.style.display = 'inline-block';
+      }
+    }
+
     function renderTimeline(msg) {
       timelinePanel.style.display = 'flex';
 
       const duration = Number(msg.duration || 0);
       const position = Number(msg.playback_offset ?? duration);
+      latestTimeline = {
+        mode: msg.mode,
+        duration,
+        position,
+        receivedAt: performance.now(),
+      };
 
-      dvrSlider.disabled = duration <= 0;
-      dvrSlider.max = duration;
-      if (!draggingSlider) {
-        dvrSlider.value = Math.min(position, duration);
-      }
-
-      timelineCurrent.textContent = formatTime(Number(dvrSlider.value || 0));
-      timelineEnd.textContent = duration > 0 ? formatTime(duration) : 'LIVE';
+      updateTimelineDisplay();
 
       if (duration <= 0) {
         timelineStatus.textContent = 'Recording starts immediately. Playback appears after first finalized segment.';
@@ -469,6 +507,13 @@
       draggingSlider = false;
       const offset = Number(dvrSlider.value || 0);
       sendCmd({ cmd: 'seek', offset });
+      latestTimeline = {
+        mode: 'playback',
+        duration: Number(dvrSlider.max || 0),
+        position: offset,
+        receivedAt: performance.now(),
+      };
+      updateTimelineDisplay();
       uiLog(`Seeking to ${formatTime(offset)}`);
       lastSeekTime = Date.now();
       liveBtn.style.display = 'inline-block';
@@ -609,6 +654,7 @@
 
         // Timeline is polled so browser UI updates while recording window grows.
         timelineTimer = setInterval(() => sendCmd({ cmd: 'timeline' }), 2000);
+        timelineRenderTimer = setInterval(updateTimelineDisplay, 250);
       };
 
       dc.onmessage = (e) => {

@@ -50,6 +50,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   MediaStreamTrack? _audioTrack;
   Timer? _answerPollTimer; // polls ValueStore for the Pi's SDP answer
   Timer? _timelinePollTimer; // requests timeline state from Pi every 2 s
+  Timer? _timelineRenderTimer; // locally smooths timeline between snapshots
   bool _isDisposed = false;
   bool _isMuted = false;
   DateTime? _lastSeekTime;
@@ -57,6 +58,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   // Timeline state
   double _totalRecordedSeconds = 0.0; // total duration available for scrubbing
   double _currentPositionSeconds = 0.0; // current playback position
+  double _timelineSnapshotPositionSeconds = 0.0;
+  DateTime? _timelineSnapshotAt;
+  String _timelineMode = 'live';
   bool _isUserScrubbing = false; // true while user drags the slider
   bool _showTimelinePanel = false;
   bool _showGoLiveButton = false;
@@ -99,6 +103,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     _isDisposed = true;
     _answerPollTimer?.cancel();
     _timelinePollTimer?.cancel();
+    _timelineRenderTimer?.cancel();
     _closePeerConnection();
     _videoRenderer.dispose();
     _nodeIdController.dispose();
@@ -217,6 +222,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     final playbackPosition = timelineData['playback_offset'] != null
         ? (timelineData['playback_offset'] as num).toDouble()
         : totalDuration;
+    _timelineMode = timelineData['mode']?.toString() ?? 'live';
+    _timelineSnapshotPositionSeconds = playbackPosition;
+    _timelineSnapshotAt = DateTime.now();
 
     _safeSetState(() {
       _showTimelinePanel = true;
@@ -244,7 +252,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
 
       if (timelineData['mode'] == 'live') {
         _timelineStatusText = 'Live mode';
-        final recentSeek = _lastSeekTime != null &&
+        final recentSeek =
+            _lastSeekTime != null &&
             DateTime.now().difference(_lastSeekTime!) <
                 const Duration(seconds: 3);
         if (!recentSeek) _showGoLiveButton = false;
@@ -256,6 +265,56 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         _timelineStatusText =
             'Playback mode - ${_formatDuration(secondsBehindLive)} behind live';
         // Show Go Live button so the user can return to the live edge.
+        _showGoLiveButton = true;
+      }
+    });
+  }
+
+  double _displayedTimelinePosition() {
+    if (_timelineMode == 'playback' && _timelineSnapshotAt != null) {
+      final elapsed =
+          DateTime.now().difference(_timelineSnapshotAt!).inMilliseconds /
+          1000.0;
+      return (_timelineSnapshotPositionSeconds + elapsed).clamp(
+        0.0,
+        _totalRecordedSeconds,
+      );
+    }
+    return _totalRecordedSeconds;
+  }
+
+  void _updateTimelineDisplay() {
+    if (_isUserScrubbing) return;
+
+    final position = _totalRecordedSeconds > 0
+        ? _displayedTimelinePosition()
+        : 0.0;
+
+    _safeSetState(() {
+      _currentPositionSeconds = position;
+      _currentTimeLabel = _formatDuration(position);
+      _totalDurationLabel = _totalRecordedSeconds > 0
+          ? _formatDuration(_totalRecordedSeconds)
+          : 'LIVE';
+
+      if (_totalRecordedSeconds <= 0) {
+        _timelineStatusText =
+            'Recording starts immediately. Playback appears after first finalized segment.';
+        _showGoLiveButton = false;
+      } else if (_timelineMode == 'live') {
+        _timelineStatusText = 'Live mode';
+        final recentSeek =
+            _lastSeekTime != null &&
+            DateTime.now().difference(_lastSeekTime!) <
+                const Duration(seconds: 3);
+        if (!recentSeek) _showGoLiveButton = false;
+      } else {
+        final secondsBehindLive = (_totalRecordedSeconds - position).clamp(
+          0.0,
+          double.infinity,
+        );
+        _timelineStatusText =
+            'Playback mode - ${_formatDuration(secondsBehindLive)} behind live';
         _showGoLiveButton = true;
       }
     });
@@ -281,6 +340,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       _showGoLiveButton = false;
       _totalRecordedSeconds = 0.0;
       _currentPositionSeconds = 0.0;
+      _timelineSnapshotPositionSeconds = 0.0;
+      _timelineSnapshotAt = null;
+      _timelineMode = 'live';
       _isUserScrubbing = false;
       _currentTimeLabel = '00:00';
       _totalDurationLabel = 'LIVE';
@@ -298,6 +360,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   Future<void> _startStream() async {
     _answerPollTimer?.cancel();
     _timelinePollTimer?.cancel();
+    _timelineRenderTimer?.cancel();
+    _timelineRenderTimer = null;
     await _closePeerConnection();
 
     _safeSetState(() {
@@ -359,6 +423,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           _timelinePollTimer = Timer.periodic(
             const Duration(seconds: 2),
             (_) => _sendDataChannelCommand({'cmd': 'timeline'}),
+          );
+          _timelineRenderTimer ??= Timer.periodic(
+            const Duration(milliseconds: 250),
+            (_) => _updateTimelineDisplay(),
           );
         }
       };
@@ -524,6 +592,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     _answerPollTimer = null;
     _timelinePollTimer?.cancel();
     _timelinePollTimer = null;
+    _timelineRenderTimer?.cancel();
+    _timelineRenderTimer = null;
 
     await _closePeerConnection();
     _videoRenderer.srcObject = null;
@@ -828,6 +898,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
               color: const Color(0xFF059669),
               onPressed: () {
                 _sendDataChannelCommand({'cmd': 'live'});
+                _timelineMode = 'live';
+                _timelineSnapshotPositionSeconds = _totalRecordedSeconds;
+                _timelineSnapshotAt = DateTime.now();
+                _updateTimelineDisplay();
                 _appendLog('Switched to live');
               },
             ),
@@ -1058,6 +1132,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
             onChangeEnd: _totalRecordedSeconds > 0
                 ? (selectedPosition) {
                     _lastSeekTime = DateTime.now();
+                    _timelineMode = 'playback';
+                    _timelineSnapshotPositionSeconds = selectedPosition;
+                    _timelineSnapshotAt = DateTime.now();
                     _safeSetState(() {
                       _isUserScrubbing = false;
                       _showGoLiveButton = true;

@@ -169,7 +169,7 @@ class WebcamTrack(VideoStreamTrack):
         video_frame.time_base = time_base
         return video_frame
 
-    async def stop(self) -> None:
+    def stop(self) -> None:
         """Release playback resources when the peer disconnects."""
         self.go_live()
 

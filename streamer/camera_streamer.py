@@ -409,7 +409,7 @@ class CameraStreamer:
         if not peer:
             return
 
-        await peer["video"].stop()
+        peer["video"].stop()
         if peer["audio"]:
             peer["audio"].release()
         await peer["pc"].close()
