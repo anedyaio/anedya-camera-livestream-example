@@ -42,6 +42,7 @@ from config import (
     TOPIC_VALUESTORE_UPDATES,
     TOPIC_HEARTBEAT,
     HEARTBEAT_INTERVAL_SECONDS,
+    RECORDING_SEGMENT_SECONDS,
 )
 from recording import RecordingManager
 from tracks import MicrophoneAudioTrack, MicrophoneSource, WebcamTrack
@@ -110,7 +111,10 @@ class CameraStreamer:
         self._event_loop:   asyncio.AbstractEventLoop | None = None
         self._mqtt_client:  mqtt_lib.Client | None       = None
 
-        self.recorder = RecordingManager(record_path=record_path)
+        self.recorder = RecordingManager(
+            record_path=record_path,
+            segment_duration_seconds=RECORDING_SEGMENT_SECONDS,
+        )
         self.source:   CameraSource | None = None
         self.audio_source: MicrophoneSource | None = None
 
@@ -351,7 +355,7 @@ class CameraStreamer:
                     else:
                         channel.send(json.dumps({
                             "type":    "error",
-                            "message": "No finalized recording available yet",
+                            "message": "No recording available at selected time",
                         }))
                 elif action == "live":
                     video_track.go_live()

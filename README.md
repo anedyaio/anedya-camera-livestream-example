@@ -64,7 +64,7 @@ When a firewall blocks direct peer-to-peer traffic, Anedya's managed TURN relay 
 
 ### Recording and Playback
 
-The Pi records continuously into 5-second MP4 segments on disk. The viewer receives a timeline over the WebRTC DataChannel and can seek into any finalized segment using the same data channel; the Pi reads and streams the file directly.
+The Pi records continuously into configurable MP4 segments on disk. The default segment duration is 60 seconds and can be changed with `RECORDING_SEGMENT_SECONDS`. The viewer receives a timeline over the WebRTC DataChannel and can seek into any finalized segment using the same data channel; the Pi reads and streams the file directly.
 
 <p align="center">
     <img src="media/playback.png" alt="TURN relay connection diagram">
@@ -158,6 +158,7 @@ ANEDYA_DEVICE_ID=your-device-uuid
 ANEDYA_NODE_ID=your-node-uuid
 ANEDYA_CONNECTION_KEY=your-connection-key
 ANEDYA_REGION=ap-in-1
+RECORDING_SEGMENT_SECONDS=60
 ```
 
 Install `uv` if not already present:

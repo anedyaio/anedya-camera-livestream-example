@@ -31,11 +31,15 @@ log = logging.getLogger("streamer")
 class RecordingManager:
     """Write rolling MP4 segments to disk and expose timeline metadata."""
 
-    SEGMENT_DURATION_SECONDS = 5
-
-    def __init__(self, record_path: str = "recordings", fps: float = 30.0):
+    def __init__(
+        self,
+        record_path: str = "recordings",
+        fps: float = 30.0,
+        segment_duration_seconds: int = 60,
+    ):
         self.record_path = record_path
         self.fps         = fps
+        self.segment_duration_seconds = segment_duration_seconds
 
         self.frame_width:  int | None = None
         self.frame_height: int | None = None
@@ -46,6 +50,8 @@ class RecordingManager:
 
         self._frame_queue: asyncio.Queue | None = None
         self._is_running   = False
+        self._dropped_frames = 0
+        self._last_drop_log_at = 0.0
 
         self._ready_event = asyncio.Event()
 
@@ -69,7 +75,14 @@ class RecordingManager:
         try:
             self._frame_queue.put_nowait((frame, captured_at))
         except asyncio.QueueFull:
-            pass
+            self._dropped_frames += 1
+            now = time.monotonic()
+            if now - self._last_drop_log_at >= 5.0:
+                log.warning(
+                    "Recording queue full; dropped_frames=%d",
+                    self._dropped_frames,
+                )
+                self._last_drop_log_at = now
 
     def _close_current_segment(self, closed_at: float) -> None:
         """Flush the current VideoWriter and register the segment metadata."""
@@ -93,6 +106,60 @@ class RecordingManager:
             "duration": duration,
         })
         self._finalized_segments.sort(key=lambda seg: seg["start_ts"])
+
+    @staticmethod
+    def _read_mp4_duration(path: str) -> float | None:
+        """Return MP4 duration in seconds, or None for unreadable files."""
+        capture = cv2.VideoCapture(path)
+        try:
+            if capture.isOpened():
+                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
+                frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+                if fps > 0 and frame_count > 0:
+                    return frame_count / fps
+        finally:
+            capture.release()
+        return None
+
+    def _load_existing_segments(self) -> None:
+        """Rebuild the DVR timeline from existing MP4 files after restart."""
+        os.makedirs(self.record_path, exist_ok=True)
+        loaded_segments: list[dict] = []
+
+        for name in os.listdir(self.record_path):
+            if not name.lower().endswith(".mp4"):
+                continue
+
+            path = os.path.join(self.record_path, name)
+            try:
+                started_at = datetime.strptime(
+                    os.path.splitext(name)[0],
+                    "%Y%m%d_%H%M%S",
+                ).timestamp()
+            except ValueError:
+                log.warning("Skipping recording with unexpected filename: %s", path)
+                continue
+
+            duration = self._read_mp4_duration(path)
+            if duration is None or duration <= 0:
+                log.warning("Skipping unreadable recording: %s", path)
+                continue
+
+            loaded_segments.append({
+                "name":     name,
+                "path":     path,
+                "size":     os.path.getsize(path) if os.path.exists(path) else 0,
+                "start_ts": started_at,
+                "end_ts":   started_at + duration,
+                "duration": duration,
+            })
+
+        self._finalized_segments = sorted(
+            loaded_segments,
+            key=lambda seg: seg["start_ts"],
+        )
+        if self._finalized_segments:
+            log.info("Loaded %d existing recording segment(s)", len(self._finalized_segments))
 
     def _start_new_segment(self, started_at: float, frame_size: tuple[int, int]) -> None:
         """Close the old segment (if any) and open a new VideoWriter."""
@@ -170,9 +237,8 @@ class RecordingManager:
         total_duration = float(timeline["duration"])
         clamped_offset = max(0.0, min(float(offset_seconds), total_duration))
 
-        for index, segment in enumerate(segments):
-            is_last_segment = index == len(segments) - 1
-            if clamped_offset < segment["end_offset"] or is_last_segment:
+        for segment in segments:
+            if segment["start_offset"] <= clamped_offset <= segment["end_offset"]:
                 in_file_offset = max(
                     0.0,
                     min(clamped_offset - segment["start_offset"], segment["duration"]),
@@ -192,6 +258,14 @@ class RecordingManager:
                 return timeline["segments"][index + 1]
         return None
 
+    def get_next_segment_after_offset(self, offset_seconds: float) -> dict | None:
+        """Return the first segment that starts after the given timeline offset."""
+        timeline = self.get_timeline()
+        for segment in timeline["segments"]:
+            if segment["start_offset"] > offset_seconds:
+                return segment
+        return None
+
     async def run(self) -> None:
         """Consume queued frames and write them to rolling MP4 files.
 
@@ -200,6 +274,7 @@ class RecordingManager:
         # maxsize=240 provides ~8 seconds of buffer at 30 fps.
         # If the disk can't keep up, frames are dropped by enqueue_frame() rather
         # than blocking the live camera pipeline.
+        self._load_existing_segments()
         self._frame_queue = asyncio.Queue(maxsize=240)
         self._is_running  = True
         self._ready_event.set()
@@ -217,7 +292,7 @@ class RecordingManager:
                     self._start_new_segment(captured_at, frame_size)
                 elif (
                     self._segment_start_ts is not None
-                    and captured_at - self._segment_start_ts >= self.SEGMENT_DURATION_SECONDS
+                    and captured_at - self._segment_start_ts >= self.segment_duration_seconds
                 ):
                     self._start_new_segment(captured_at, frame_size)
                 elif frame_size != (self.frame_width, self.frame_height):

@@ -271,7 +271,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   }
 
   double _displayedTimelinePosition() {
-    if (_timelineMode == 'playback' && _timelineSnapshotAt != null) {
+    if ((_timelineMode == 'playback' || _timelineMode == 'gap') &&
+        _timelineSnapshotAt != null) {
       final elapsed =
           DateTime.now().difference(_timelineSnapshotAt!).inMilliseconds /
           1000.0;
@@ -308,6 +309,9 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
             DateTime.now().difference(_lastSeekTime!) <
                 const Duration(seconds: 3);
         if (!recentSeek) _showGoLiveButton = false;
+      } else if (_timelineMode == 'gap') {
+        _timelineStatusText = 'No recording available';
+        _showGoLiveButton = true;
       } else {
         final secondsBehindLive = (_totalRecordedSeconds - position).clamp(
           0.0,

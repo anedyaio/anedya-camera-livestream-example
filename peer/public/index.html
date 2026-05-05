@@ -327,6 +327,7 @@
     let timelineTimer = null;
     let timelineRenderTimer = null;
     let latestTimeline = null;
+    let timelineReadyLogged = false;
     let draggingSlider = false;
     let lastSeekTime = 0;
 
@@ -384,6 +385,7 @@
     function resetUI() {
       video.srcObject = null;
       latestTimeline = null;
+      timelineReadyLogged = false;
       networkModeEl.textContent = 'Mode: --';
       networkModeEl.className = '';
       startBtn.disabled = false;
@@ -422,7 +424,7 @@
 
     function getDisplayedTimelinePosition() {
       if (!latestTimeline) return 0;
-      if (latestTimeline.mode === 'playback') {
+      if (latestTimeline.mode === 'playback' || latestTimeline.mode === 'gap') {
         const elapsed = (performance.now() - latestTimeline.receivedAt) / 1000;
         return Math.min(latestTimeline.position + elapsed, latestTimeline.duration);
       }
@@ -448,6 +450,9 @@
         if (Date.now() - lastSeekTime > 3000) {
           liveBtn.style.display = 'none';
         }
+      } else if (latestTimeline.mode === 'gap') {
+        timelineStatus.textContent = 'No recording available';
+        liveBtn.style.display = 'inline-block';
       } else {
         const behindLive = Math.max(0, duration - position);
         timelineStatus.textContent = `Playback mode - ${formatTime(behindLive)} behind live`;
@@ -480,6 +485,9 @@
         if (Date.now() - lastSeekTime > 3000) {
           liveBtn.style.display = 'none';
         }
+      } else if (msg.mode === 'gap') {
+        timelineStatus.textContent = 'No recording available';
+        liveBtn.style.display = 'inline-block';
       } else {
         const behindLive = Math.max(0, duration - position);
         timelineStatus.textContent = `Playback mode - ${formatTime(behindLive)} behind live`;
@@ -658,11 +666,19 @@
       };
 
       dc.onmessage = (e) => {
-        const msg = JSON.parse(e.data);
-        if (msg.type === 'timeline') {
-          renderTimeline(msg);
-        } else if (msg.type === 'error') {
-          uiLog('Error: ' + msg.message);
+        try {
+          const msg = JSON.parse(e.data);
+          if (msg.type === 'timeline') {
+            if (!timelineReadyLogged) {
+              uiLog('Timeline ready');
+              timelineReadyLogged = true;
+            }
+            renderTimeline(msg);
+          } else if (msg.type === 'error') {
+            uiLog('Error: ' + msg.message);
+          }
+        } catch (err) {
+          uiLog('DataChannel message error: ' + err.message);
         }
       };
 
