@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
     "aiortc",
     "av",
+    "imageio-ffmpeg>=0.6.0; platform_system == 'Windows'",
+    "linuxpy>=0.24.0; platform_system == 'Linux'",
     "numpy",
     "opencv-python",
     "paho-mqtt",

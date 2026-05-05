@@ -147,6 +147,7 @@ class CameraStreamer:
             client = mqtt_lib.Client(client_id=ANEDYA_DEVICE_ID)
 
         # Anedya uses the device ID as both username and the connection key as password.
+        log.info("MQTT client configured: username=%s", ANEDYA_DEVICE_ID)
         client.username_pw_set(ANEDYA_DEVICE_ID, ANEDYA_CONNECTION_KEY)
 
         tls_context = ssl.create_default_context()
@@ -464,7 +465,8 @@ class CameraStreamer:
         self.recorder.stop()
 
         if self._heartbeat_task:
-            self._heartbeat_task.cancel()
+            canceled = self._heartbeat_task.cancel()
+            log.info("Heartbeat task canceled: %s", canceled)
             self._heartbeat_task = None
 
         if self._mqtt_client:

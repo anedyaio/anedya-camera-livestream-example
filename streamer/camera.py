@@ -11,11 +11,17 @@ for the next frame without blocking the capture loop.
 
 Also contains:
   configure_camera_max_resolution — probe and select the highest camera mode.
+  discover_best_camera_mode       — enumerate platform camera capabilities first.
   draw_timestamp                  — burn a date/time stamp onto frame pixels.
 """
 
 import asyncio
+from dataclasses import dataclass
 import logging
+import platform
+import re
+import shutil
+import subprocess
 import time
 from datetime import datetime
 
@@ -32,13 +38,171 @@ from recording import RecordingManager
 log = logging.getLogger("streamer")
 
 
+@dataclass(frozen=True)
+class CameraMode:
+    width: int
+    height: int
+    fps: float
+    fourcc: str
+
+
+def _normalize_fourcc(value: object) -> str:
+    text = str(value).upper().strip()
+    if text in {"MJPEG", "MJPG"}:
+        return "MJPG"
+    if text in {"YUYV", "YUYV422", "YUY2"}:
+        return "YUYV"
+    return text[:4]
+
+
+def _choose_best_mode(modes: list[CameraMode], target_fps: float) -> CameraMode | None:
+    # Prefer modes that meet the requested FPS, then maximize captured pixels.
+    # This keeps live streaming and recording on the same highest usable source.
+    candidates = [
+        mode for mode in modes
+        if target_fps <= 0 or mode.fps >= target_fps
+    ] or modes
+    if not candidates:
+        return None
+
+    return max(
+        candidates,
+        key=lambda mode: (
+            mode.width * mode.height,
+            mode.fourcc == "MJPG",
+            mode.fps,
+        ),
+    )
+
+
+def _linux_camera_modes(camera_index: int) -> list[CameraMode]:
+    """Read V4L2 modes via linuxpy on Linux/Pi. Empty list means use fallback."""
+    try:
+        from linuxpy.video.device import Device
+    except Exception:
+        return []
+
+    modes: list[CameraMode] = []
+    try:
+        with Device.from_id(camera_index) as camera:
+            for frame_type in camera.info.frame_types:
+                pixel_format = frame_type.pixel_format
+                fourcc = _normalize_fourcc(
+                    pixel_format.human_str()
+                    if hasattr(pixel_format, "human_str")
+                    else getattr(pixel_format, "name", pixel_format)
+                )
+                fps = float(frame_type.max_fps or frame_type.min_fps or 0)
+                if fps > 0:
+                    modes.append(
+                        CameraMode(frame_type.width, frame_type.height, fps, fourcc)
+                    )
+    except Exception as exc:
+        log.debug("linuxpy camera capability discovery failed: %s", exc)
+    return modes
+
+
+def _ffmpeg_exe() -> str | None:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg:
+        return ffmpeg
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _windows_camera_name(ffmpeg: str, camera_index: int) -> str | None:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    devices = [
+        match.group(1)
+        for match in re.finditer(r'"([^"]+)"\s+\(video\)', result.stderr + result.stdout)
+    ]
+    return devices[camera_index] if 0 <= camera_index < len(devices) else None
+
+
+def _windows_camera_modes(camera_index: int) -> list[CameraMode]:
+    """Read DirectShow modes via FFmpeg on Windows. Empty list means use fallback."""
+    ffmpeg = _ffmpeg_exe()
+    if not ffmpeg:
+        return []
+
+    try:
+        camera_name = _windows_camera_name(ffmpeg, camera_index)
+        if not camera_name:
+            return []
+
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-f",
+                "dshow",
+                "-list_options",
+                "true",
+                "-i",
+                f"video={camera_name}",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+    except Exception as exc:
+        log.debug("FFmpeg camera capability discovery failed: %s", exc)
+        return []
+
+    modes: list[CameraMode] = []
+    for line in (result.stderr + result.stdout).splitlines():
+        format_match = re.search(r"(?:pixel_format|vcodec)=([^\s]+)", line)
+        sizes = re.findall(r"s=(\d+)x(\d+)", line)
+        fps_values = re.findall(r"fps=([0-9.]+)", line)
+        if not format_match or not sizes or not fps_values:
+            continue
+
+        width, height = map(int, sizes[-1])
+        fps = float(fps_values[-1])
+        modes.append(
+            CameraMode(width, height, fps, _normalize_fourcc(format_match.group(1)))
+        )
+    return modes
+
+
+def discover_best_camera_mode(camera_index: int, target_fps: float) -> CameraMode | None:
+    """Discover the best camera mode before falling back to OpenCV probing."""
+    system = platform.system()
+    if system == "Linux":
+        modes = _linux_camera_modes(camera_index)
+    elif system == "Windows":
+        modes = _windows_camera_modes(camera_index)
+    else:
+        modes = []
+
+    mode = _choose_best_mode(modes, target_fps)
+    if mode:
+        log.info(
+            "Selected camera mode from capabilities: %dx%d @ %.1f fps %s",
+            mode.width, mode.height, mode.fps, mode.fourcc,
+        )
+    return mode
+
+
 def configure_camera_max_resolution(
     cap: cv2.VideoCapture,
     target_fps: float,
+    camera_index: int | None = None,
 ) -> tuple[int, int, float]:
-    """Probe the camera driver for the highest supported resolution.
+    """Select the highest camera mode, falling back to OpenCV probing.
 
-    Iterates CAPTURE_RESOLUTION_CANDIDATES (highest first) and asks the
+    Uses platform capability discovery when available, otherwise iterates
+    CAPTURE_RESOLUTION_CANDIDATES (highest first) and asks the
     driver for each one. Drivers typically clamp unsupported modes to the
     best available, so the loop stops as soon as the returned size matches
     the requested size.
@@ -46,6 +210,21 @@ def configure_camera_max_resolution(
     Returns:
         (actual_width, actual_height, actual_fps)
     """
+    mode = (
+        discover_best_camera_mode(camera_index, target_fps)
+        if camera_index is not None
+        else None
+    )
+    if mode:
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*mode.fourcc))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, mode.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, mode.height)
+        cap.set(cv2.CAP_PROP_FPS, mode.fps)
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or mode.width)
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or mode.height)
+        actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or mode.fps)
+        return actual_width, actual_height, actual_fps
+
     best_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 0)
     best_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     best_area   = best_width * best_height
@@ -125,7 +304,7 @@ class CameraSource:
         recorder: RecordingManager,
         analysis_width:  int   = MOTION_ANALYSIS_WIDTH,
         analysis_height: int   = MOTION_ANALYSIS_HEIGHT,
-        fps:             float = 30.0,
+        fps:             float = 60.0,
         enable_motion_detection: bool = False,
     ):
         self.camera_index    = camera_index
@@ -135,13 +314,27 @@ class CameraSource:
         self.fps             = fps
         self.enable_motion_detection = enable_motion_detection
 
-        self.cap = cv2.VideoCapture(camera_index)
+        system = platform.system()
+        if system == "Windows":
+            backend = cv2.CAP_DSHOW
+        else:
+            backend = cv2.CAP_V4L2
+
+        self.cap = cv2.VideoCapture(camera_index, backend)
+        self.cap.set(
+            cv2.CAP_PROP_FOURCC,
+            cv2.VideoWriter_fourcc(*"MJPG"),
+        )
+
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open camera index {camera_index}")
 
         self.capture_width, self.capture_height, self.capture_fps = (
-            configure_camera_max_resolution(self.cap, fps)
+            configure_camera_max_resolution(self.cap, fps, camera_index)
         )
+        if self.capture_fps > 0:
+            self.fps = self.capture_fps
+            self.recorder.fps = self.capture_fps
         log.info(
             "Camera %d opened: %dx%d @ %.1f fps",
             camera_index, self.capture_width, self.capture_height, self.capture_fps,

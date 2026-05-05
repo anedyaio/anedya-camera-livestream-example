@@ -13,6 +13,7 @@ Turn a Raspberry Pi into a CCTV-style camera system using Anedya for signaling a
 - **Live WebRTC video streaming :** low-latency peer-to-peer video using Anedya-managed STUN/TURN
 - **Local Recording :** continuous MP4 segments written to disk on the Pi
 - **Playback :** scrub through past footage from the viewer without any server-side transcoding
+- **Automatic max camera mode :** selects the highest usable camera capability for both live streaming and local recording
 - **Motion detection overlay :** bounding boxes drawn on detected motion regions in real time
 - **Microphone audio :** capture and stream Pi microphone audio alongside video
 - **Web viewer :** browser-based viewer, no install required
@@ -250,6 +251,10 @@ This project uses OpenCV `VideoCapture`.
 
 - **USB/UVC webcams** work out of the box on most Pi setups.
 - **CSI cameras** (Pi Camera Module): ensure the camera is enabled in `raspi-config` and test with `libcamera-still` before running the streamer.
+- **Linux / Raspberry Pi**: the streamer uses `linuxpy` to enumerate V4L2 camera modes, selects the highest usable resolution/FPS mode, then applies that mode to OpenCV.
+- **Windows**: the streamer uses FFmpeg DirectShow mode listing through `imageio-ffmpeg` when available, then applies the selected mode to OpenCV.
+- If capability discovery fails on either platform, the streamer falls back to OpenCV resolution probing.
+- The selected capture mode is shared by both the WebRTC live stream and the MP4 recorder.
 - If capture fails on index `0`, try `--camera 1` or check `ls /dev/video*`.
 
 ---

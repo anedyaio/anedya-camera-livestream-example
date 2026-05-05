@@ -279,6 +279,28 @@ wheels = [
 ]
 
 [[package]]
+name = "imageio-ffmpeg"
+version = "0.6.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/44/bd/c3343c721f2a1b0c9fc71c1aebf1966a3b7f08c2eea8ed5437a2865611d6/imageio_ffmpeg-0.6.0.tar.gz", hash = "sha256:e2556bed8e005564a9f925bb7afa4002d82770d6b08825078b7697ab88ba1755", size = 25210, upload-time = "2025-01-16T21:34:32.747Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a0/13/59da54728351883c3c1d9fca1710ab8eee82c7beba585df8f25ca925f08f/imageio_ffmpeg-0.6.0-py3-none-win32.whl", hash = "sha256:196faa79366b4a82f95c0f4053191d2013f4714a715780f0ad2a68ff37483cc2", size = 19652251, upload-time = "2025-01-16T21:34:06.812Z" },
+    { url = "https://files.pythonhosted.org/packages/2c/c6/fa760e12a2483469e2bf5058c5faff664acf66cadb4df2ad6205b016a73d/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl", hash = "sha256:02fa47c83703c37df6bfe4896aab339013f62bf02c5ebf2dce6da56af04ffc0a", size = 31246824, upload-time = "2025-01-16T21:34:28.6Z" },
+]
+
+[[package]]
+name = "linuxpy"
+version = "0.24.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions", marker = "python_full_version < '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a3/f7/66d76bb3099bce8a952e6114e654d1199d7a02aec90a300294919bd17f77/linuxpy-0.24.0.tar.gz", hash = "sha256:2b44434d28d49257e859a4830267a25aa4b51b1d229f95f79d025ae7f1a5d30e", size = 451602, upload-time = "2026-02-19T14:13:50.47Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8a/d8/6ce2855fda8123ff7d127821743de7aa1609cda025183b9c4046d5b36205/linuxpy-0.24.0-py3-none-any.whl", hash = "sha256:4e2ce8da45a7a7171bcdcf6b7ab53858d9a83108e24874bd9ddb50a73590a1c6", size = 453120, upload-time = "2026-02-19T14:13:47.686Z" },
+]
+
+[[package]]
 name = "numpy"
 version = "2.4.4"
 source = { registry = "https://pypi.org/simple" }
@@ -488,6 +510,8 @@ source = { editable = "." }
 dependencies = [
     { name = "aiortc" },
     { name = "av" },
+    { name = "imageio-ffmpeg", marker = "sys_platform == 'win32'" },
+    { name = "linuxpy", marker = "sys_platform == 'linux'" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "paho-mqtt" },
@@ -504,6 +528,8 @@ dev = [
 requires-dist = [
     { name = "aiortc" },
     { name = "av" },
+    { name = "imageio-ffmpeg", marker = "sys_platform == 'win32'", specifier = ">=0.6.0" },
+    { name = "linuxpy", marker = "sys_platform == 'linux'", specifier = ">=0.24.0" },
     { name = "numpy" },
     { name = "opencv-python" },
     { name = "paho-mqtt" },
