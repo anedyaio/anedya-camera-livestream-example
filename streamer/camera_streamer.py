@@ -43,6 +43,7 @@ from config import (
     TOPIC_HEARTBEAT,
     HEARTBEAT_INTERVAL_SECONDS,
     RECORDING_SEGMENT_SECONDS,
+    RECORDING_RETENTION_SECONDS,
 )
 from recording import RecordingManager
 from tracks import MicrophoneAudioTrack, MicrophoneSource, WebcamTrack
@@ -114,6 +115,7 @@ class CameraStreamer:
         self.recorder = RecordingManager(
             record_path=record_path,
             segment_duration_seconds=RECORDING_SEGMENT_SECONDS,
+            retention_seconds=RECORDING_RETENTION_SECONDS,
         )
         self.source:   CameraSource | None = None
         self.audio_source: MicrophoneSource | None = None

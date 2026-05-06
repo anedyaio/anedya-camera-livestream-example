@@ -36,10 +36,12 @@ class RecordingManager:
         record_path: str = "recordings",
         fps: float = 30.0,
         segment_duration_seconds: int = 60,
+        retention_seconds: int = 7 * 24 * 60 * 60,
     ):
         self.record_path = record_path
         self.fps         = fps
         self.segment_duration_seconds = segment_duration_seconds
+        self.retention_seconds = retention_seconds
 
         self.frame_width:  int | None = None
         self.frame_height: int | None = None
@@ -106,6 +108,39 @@ class RecordingManager:
             "duration": duration,
         })
         self._finalized_segments.sort(key=lambda seg: seg["start_ts"])
+        self._prune_expired_segments(closed_at)
+
+    def _prune_expired_segments(self, now: float | None = None) -> None:
+        """Delete finalized recordings fully outside the retention window."""
+        cutoff = (now if now is not None else time.time()) - self.retention_seconds
+        retained_segments: list[dict] = []
+        deleted_count = 0
+        freed_bytes = 0
+
+        for segment in self._finalized_segments:
+            if segment["end_ts"] >= cutoff:
+                retained_segments.append(segment)
+                continue
+
+            path = segment["path"]
+            try:
+                size = os.path.getsize(path) if os.path.exists(path) else 0
+                if os.path.exists(path):
+                    os.remove(path)
+                deleted_count += 1
+                freed_bytes += size
+            except OSError as exc:
+                log.warning("Could not delete expired recording %s: %s", path, exc)
+                retained_segments.append(segment)
+
+        if deleted_count:
+            log.info(
+                "Pruned %d expired recording segment(s), freed %.2f MB",
+                deleted_count,
+                freed_bytes / (1024 * 1024),
+            )
+
+        self._finalized_segments = retained_segments
 
     @staticmethod
     def _read_mp4_duration(path: str) -> float | None:
@@ -160,6 +195,7 @@ class RecordingManager:
         )
         if self._finalized_segments:
             log.info("Loaded %d existing recording segment(s)", len(self._finalized_segments))
+        self._prune_expired_segments()
 
     def _start_new_segment(self, started_at: float, frame_size: tuple[int, int]) -> None:
         """Close the old segment (if any) and open a new VideoWriter."""

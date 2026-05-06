@@ -106,7 +106,21 @@ TOPIC_ERRORS             = f"$anedya/device/{ANEDYA_DEVICE_ID}/errors"
 TOPIC_HEARTBEAT          = f"$anedya/device/{ANEDYA_DEVICE_ID}/heartbeat/json"
 HEARTBEAT_INTERVAL_SECONDS = MQTT_KEEPALIVE
 
-RECORDING_SEGMENT_SECONDS = get_int_env("RECORDING_SEGMENT_SECONDS", 60, minimum=1)
+RECORDING_SEGMENT_SECONDS = get_int_env("RECORDING_SEGMENT_SECONDS", 5, minimum=1)
+
+RECORDING_RETENTION_DAYS  = get_int_env("RECORDING_RETENTION_DAYS", 7, minimum=0)
+RECORDING_RETENTION_HOURS = get_int_env("RECORDING_RETENTION_HOURS", 0, minimum=0)
+RECORDING_RETENTION_SECONDS = get_int_env(
+    "RECORDING_RETENTION_SECONDS",
+    RECORDING_RETENTION_DAYS * 24 * 60 * 60
+    + RECORDING_RETENTION_HOURS * 60 * 60,
+    minimum=0,
+)
+if RECORDING_RETENTION_SECONDS <= 0:
+    log.warning(
+        "Recording retention must be greater than 0; using default 7 days"
+    )
+    RECORDING_RETENTION_SECONDS = 7 * 24 * 60 * 60
 
 AUDIO_SAMPLE_RATE   = 48000  # Hz — standard WebRTC audio sample rate
 AUDIO_CHANNELS      = 1      # mono
