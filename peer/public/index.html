@@ -87,6 +87,7 @@
       max-width: 640px;
       display: flex;
       justify-content: flex-end;
+      gap: 0.75rem;
     }
 
     button {
@@ -120,8 +121,14 @@
     }
 
     #settingsBtn,
-    #saveSettingsBtn {
+    #saveSettingsBtn,
+    #fullscreenBtn {
       background: #374151;
+    }
+
+    #fullscreenBtn {
+      padding: 0.75rem 1rem;
+      font-size: 1.2rem;
     }
 
     .toggle-row {
@@ -235,6 +242,7 @@
   <video id="video" autoplay playsinline></video>
 
   <div class="toolbar">
+      <button id="fullscreenBtn" type="button">⛶</button>
     <button id="settingsBtn" type="button">Settings</button>
   </div>
 
@@ -299,6 +307,7 @@
     const stopBtn = document.getElementById('stopBtn');
     const liveBtn = document.getElementById('liveBtn');
     const settingsBtn = document.getElementById('settingsBtn');
+    const fullscreenBtn = document.getElementById('fullscreenBtn');
     const relayOnlyToggle = document.getElementById('relayOnlyToggle');
     const muteToggle = document.getElementById('muteToggle');
     const settingsPanel = document.getElementById('settings-panel');
@@ -589,6 +598,18 @@
     }
 
     settingsBtn.addEventListener('click', toggleSettingsPanel);
+
+    fullscreenBtn.addEventListener('click', async () => {
+      try {
+        if (!document.fullscreenElement) {
+          await video.requestFullscreen();
+        } else {
+          await document.exitFullscreen();
+        }
+      } catch (err) {
+        uiLog('Fullscreen error: ' + err.message);
+      }
+    });
 
     saveSettingsBtn.addEventListener('click', () => {
       const nodeId = nodeIdInput.value.trim();
