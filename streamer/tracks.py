@@ -51,6 +51,12 @@ class WebcamTrack(VideoStreamTrack):
         self._current_mode:         str                    = "live"
         self._playback_capture:     cv2.VideoCapture | None = None
         self._playback_file_path:   str | None             = None
+        self._playback_segment_duration: float              = 0.0
+        self._playback_frame_count: int                     = 0
+        self._playback_started_at:  float                   = 0.0
+        self._playback_start_in_file_offset: float          = 0.0
+        self._playback_last_frame_index: int                = -1
+        self._playback_last_frame: np.ndarray | None        = None
         # Tracks the absolute offset (from recording window start) at which the
         # current segment file begins. Added to the in-file position to produce
         # the global scrubber offset reported back to the peer.
@@ -70,8 +76,12 @@ class WebcamTrack(VideoStreamTrack):
             return self._current_gap_offset()
         if self._current_mode != "playback" or not self._playback_capture:
             return None
-        in_file_ms = self._playback_capture.get(cv2.CAP_PROP_POS_MSEC)
-        return self._playback_base_offset + max(0.0, in_file_ms / 1000.0)
+        elapsed = max(0.0, time.monotonic() - self._playback_started_at)
+        in_file_offset = min(
+            self._playback_segment_duration,
+            self._playback_start_in_file_offset + elapsed,
+        )
+        return self._playback_base_offset + in_file_offset
 
     def _current_gap_offset(self) -> float:
         if self._current_mode != "gap":
@@ -87,11 +97,20 @@ class WebcamTrack(VideoStreamTrack):
             self._playback_capture = None
             return False
 
-        if in_file_offset > 0:
-            self._playback_capture.set(cv2.CAP_PROP_POS_MSEC, in_file_offset * 1000.0)
-
         self._playback_file_path   = segment["path"]
         self._playback_base_offset = segment["start_offset"]
+        self._playback_segment_duration = max(0.0, float(segment["duration"]))
+        self._playback_frame_count = max(
+            1,
+            int(self._playback_capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1),
+        )
+        self._playback_started_at = time.monotonic()
+        self._playback_start_in_file_offset = max(
+            0.0,
+            min(float(in_file_offset), self._playback_segment_duration),
+        )
+        self._playback_last_frame_index = -1
+        self._playback_last_frame = None
         self._gap_next_segment     = None
         self._current_mode         = "playback"
         return True
@@ -142,6 +161,12 @@ class WebcamTrack(VideoStreamTrack):
             self._playback_capture.release()
             self._playback_capture = None
         self._playback_file_path   = None
+        self._playback_segment_duration = 0.0
+        self._playback_frame_count = 0
+        self._playback_started_at = 0.0
+        self._playback_start_in_file_offset = 0.0
+        self._playback_last_frame_index = -1
+        self._playback_last_frame = None
         self._playback_base_offset = 0.0
         self._gap_base_offset      = 0.0
         self._gap_started_at       = 0.0
@@ -159,9 +184,31 @@ class WebcamTrack(VideoStreamTrack):
         if not self._playback_capture or not self._playback_file_path:
             return None
 
-        ret, frame = await asyncio.to_thread(self._playback_capture.read)
-        if ret:
-            return frame
+        elapsed = max(0.0, time.monotonic() - self._playback_started_at)
+        in_file_offset = self._playback_start_in_file_offset + elapsed
+        if in_file_offset < self._playback_segment_duration:
+            target_frame_index = int(
+                (in_file_offset / self._playback_segment_duration)
+                * self._playback_frame_count
+            )
+            target_frame_index = max(
+                0,
+                min(target_frame_index, self._playback_frame_count - 1),
+            )
+
+            if (
+                target_frame_index == self._playback_last_frame_index
+                and self._playback_last_frame is not None
+            ):
+                return self._playback_last_frame.copy()
+
+            if target_frame_index != self._playback_last_frame_index + 1:
+                self._playback_capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
+            ret, frame = await asyncio.to_thread(self._playback_capture.read)
+            if ret:
+                self._playback_last_frame_index = target_frame_index
+                self._playback_last_frame = frame
+                return frame
 
         # Current segment exhausted — try to continue with the next one.
         next_segment = self.recorder.get_next_segment(self._playback_file_path)
@@ -180,6 +227,12 @@ class WebcamTrack(VideoStreamTrack):
             self._playback_capture.release()
             self._playback_capture = None
             self._playback_file_path = None
+            self._playback_segment_duration = 0.0
+            self._playback_frame_count = 0
+            self._playback_started_at = 0.0
+            self._playback_start_in_file_offset = 0.0
+            self._playback_last_frame_index = -1
+            self._playback_last_frame = None
             self._playback_base_offset = 0.0
             self._gap_base_offset = current_offset or current_segment_end
             self._gap_started_at = time.monotonic()
@@ -188,17 +241,10 @@ class WebcamTrack(VideoStreamTrack):
             log.info("Playback entered recording gap @ %.1fs", self._gap_base_offset)
             return self._gap_frame()
 
-        self._playback_capture.release()
-        self._playback_capture = cv2.VideoCapture(next_segment["path"])
-        if not self._playback_capture.isOpened():
-            self._playback_capture = None
-            self._playback_file_path = None
+        if not self._open_playback_segment(next_segment, 0.0):
             return None
 
-        self._playback_file_path   = next_segment["path"]
-        self._playback_base_offset = next_segment["start_offset"]
-        ret, frame = await asyncio.to_thread(self._playback_capture.read)
-        return frame if ret else None
+        return await self._read_next_playback_frame()
 
     def _gap_frame(self) -> np.ndarray:
         frame = np.zeros(

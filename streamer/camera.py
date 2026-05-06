@@ -256,7 +256,11 @@ def configure_camera_max_resolution(
     return best_width, best_height, actual_fps
 
 
-def draw_timestamp(frame: np.ndarray, captured_at: float) -> np.ndarray:
+def draw_status_overlay(
+    frame: np.ndarray,
+    captured_at: float,
+    measured_fps: float | None = None,
+) -> np.ndarray:
     """Burn the capture date and time into the bottom-left corner of the frame.
 
     Draws a semi-transparent black background behind the text so it remains
@@ -282,6 +286,30 @@ def draw_timestamp(frame: np.ndarray, captured_at: float) -> np.ndarray:
         -1,
     )
     cv2.putText(frame, timestamp_text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+
+    if measured_fps is not None:
+        fps_text = f"{measured_fps:.1f} FPS"
+        (fps_w, fps_h), fps_baseline = cv2.getTextSize(fps_text, font, scale, thickness)
+        fps_x = max(12, frame.shape[1] - fps_w - margin_x)
+        fps_y = margin_y + fps_h
+
+        cv2.rectangle(
+            frame,
+            (fps_x - 6,         fps_y - fps_h - 6),
+            (fps_x + fps_w + 6, fps_y + fps_baseline + 6),
+            (0, 0, 0),
+            -1,
+        )
+        cv2.putText(
+            frame,
+            fps_text,
+            (fps_x, fps_y),
+            font,
+            scale,
+            (255, 255, 255),
+            thickness,
+            cv2.LINE_AA,
+        )
     return frame
 
 
@@ -356,6 +384,9 @@ class CameraSource:
         self._frame_sequence    = 0
         self._latest_frame:     np.ndarray | None = None
         self._latest_timestamp: float             = 0.0
+        self._measured_fps:     float | None      = None
+        self._fps_window_started_at = time.monotonic()
+        self._fps_window_frames     = 0
 
         self._is_running = False
         self._capture_task: asyncio.Task | None = None
@@ -372,7 +403,7 @@ class CameraSource:
 
         # Return early if motion detection is disabled.
         if not self.enable_motion_detection:
-            return draw_timestamp(raw_frame, now), now
+            return draw_status_overlay(raw_frame, now, self._measured_fps), now
 
         # Assert that the background subtractor is initialized.
         assert self._background_subtractor is not None
@@ -423,7 +454,16 @@ class CameraSource:
                 y2 = int((y + h + roi_y_offset) * scale_y)
                 cv2.rectangle(raw_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        return draw_timestamp(raw_frame, now), now
+        return draw_status_overlay(raw_frame, now, self._measured_fps), now
+
+    def _update_measured_fps(self) -> None:
+        self._fps_window_frames += 1
+        now = time.monotonic()
+        elapsed = now - self._fps_window_started_at
+        if elapsed >= 1.0:
+            self._measured_fps = self._fps_window_frames / elapsed
+            self._fps_window_started_at = now
+            self._fps_window_frames = 0
 
     async def _capture_loop(self) -> None:
         """Main capture loop: read → analyse → annotate → record → publish."""
@@ -436,6 +476,8 @@ class CameraSource:
             if not ret:
                 await asyncio.sleep(0.05)
                 continue
+
+            self._update_measured_fps()
 
             # CPU-intensive OpenCV processing runs in a thread to keep event loop free.
             annotated_frame, now = await asyncio.to_thread(self._process_raw_frame, raw_frame)
