@@ -216,10 +216,12 @@ def configure_camera_max_resolution(
         else None
     )
     if mode:
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*mode.fourcc))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, mode.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, mode.height)
         cap.set(cv2.CAP_PROP_FPS, mode.fps)
+        # Some backends reset pixel format when size/FPS changes. Apply FOURCC
+        # last so USB webcams stay on compressed MJPG instead of slow YUYV/YUY2.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*mode.fourcc))
         actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or mode.width)
         actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or mode.height)
         actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or mode.fps)
@@ -288,7 +290,8 @@ def draw_status_overlay(
     cv2.putText(frame, timestamp_text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
 
     if measured_fps is not None:
-        fps_text = f"{measured_fps:.1f} FPS"
+        height, width = frame.shape[:2]
+        fps_text = f"{width}x{height} {measured_fps:.1f} FPS"
         (fps_w, fps_h), fps_baseline = cv2.getTextSize(fps_text, font, scale, thickness)
         fps_x = max(12, frame.shape[1] - fps_w - margin_x)
         fps_y = margin_y + fps_h
