@@ -1,18 +1,18 @@
 """
-Rolling MP4 segment recorder.
+Rolling MP4 segment recorder with audio.
 
-RecordingManager runs as a background asyncio task. It consumes frames
-queued by CameraSource and writes them into fixed-length MP4 files on disk.
-It also maintains a list of finalized segments that the playback system
-uses to serve DVR scrubbing to viewers.
+RecordingManager runs as a background asyncio task. It consumes video frames
+queued by CameraSource and audio PCM frames queued by MicrophoneSource, writing
+them into fixed-length MP4 files on disk using PyAV (mpeg4 video + AAC audio).
 
 Segment lifecycle:
     1. CameraSource calls enqueue_frame() with each captured frame.
-    2. The run() loop pulls frames off the queue and writes them to the
-       current segment file via OpenCV VideoWriter.
-    3. Every SEGMENT_DURATION_SECONDS the writer is flushed and a new file
-       is opened. The closed file is added to _finalized_segments.
-    4. Peers call get_timeline() and resolve_playback_offset() to map slider
+    2. MicrophoneSource calls enqueue_audio() with each 20 ms PCM block.
+    3. The run() loop pulls video frames and drains the audio queue,
+       writing both to the active av container.
+    4. Every SEGMENT_DURATION_SECONDS the container is flushed/closed and a
+       new one is opened. The closed file is added to _finalized_segments.
+    5. Peers call get_timeline() and resolve_playback_offset() to map slider
        positions back to segment files and in-file seek positions.
 """
 
@@ -22,14 +22,17 @@ import os
 import time
 from datetime import datetime
 
+import av
 import cv2
 import numpy as np
+
+from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE
 
 log = logging.getLogger("streamer")
 
 
 class RecordingManager:
-    """Write rolling MP4 segments to disk and expose timeline metadata."""
+    """Write rolling MP4 segments (video + audio) to disk and expose timeline metadata."""
 
     def __init__(
         self,
@@ -39,19 +42,34 @@ class RecordingManager:
         retention_seconds: int = 24 * 60 * 60,
     ):
         self.record_path = record_path
-        self.fps         = fps
+        self.fps = fps
         self.segment_duration_seconds = segment_duration_seconds
         self.retention_seconds = retention_seconds
 
-        self.frame_width:  int | None = None
+        self.frame_width: int | None = None
         self.frame_height: int | None = None
 
-        self._video_writer:     cv2.VideoWriter | None = None
-        self._segment_start_ts: float | None           = None
-        self._segment_path:     str | None             = None
+        # PyAV output container and streams (replace cv2.VideoWriter)
+        self._av_container = None  # current open MP4 file
+        self._av_video_stream = None  # video track inside current open MP4 file
+        self._av_audio_stream = None  # audio track inside current open MP4 file
 
-        self._frame_queue: asyncio.Queue | None = None
-        self._is_running   = False
+        # PTS = Presentation Time Stamp
+        # The number of video/audio frames written so far, used to set the timestamp
+        # on each frame packet before writing to the container.
+        self._video_pts: int = 0
+        self._audio_pts: int = 0
+
+        self._segment_start_ts: float | None = None
+        self._segment_path: str | None = None
+
+        self._frame_queue: asyncio.Queue | None = (
+            None  # video frames waiting to be written
+        )
+        self._audio_queue: asyncio.Queue | None = (
+            None  # audio frames waiting to be written
+        )
+        self._is_running = False
         self._dropped_frames = 0
         self._last_drop_log_at = 0.0
 
@@ -60,14 +78,14 @@ class RecordingManager:
         # Only closed (fully written) segments are listed here. The in-progress
         # segment is not added until _close_current_segment() is called because
         # partially-written MP4 files cannot be seeked reliably.
-        self._finalized_segments: list[dict] = []
+        self._finalized_segments: list[dict] = []  # list of closed segments
 
     async def wait_until_ready(self) -> None:
         """Block until the background recording loop has started."""
         await self._ready_event.wait()
 
     def enqueue_frame(self, frame: np.ndarray, captured_at: float) -> None:
-        """Queue a frame for disk writing (called from CameraSource).
+        """Queue a video frame for disk writing (called from CameraSource).
 
         Non-blocking — frames are dropped if the queue is full rather than
         stalling the live capture pipeline.
@@ -86,27 +104,76 @@ class RecordingManager:
                 )
                 self._last_drop_log_at = now
 
-    def _close_current_segment(self, closed_at: float) -> None:
-        """Flush the current VideoWriter and register the segment metadata."""
-        if not self._video_writer or self._segment_start_ts is None or self._segment_path is None:
+    def enqueue_audio(self, pcm: np.ndarray) -> None:
+        """Queue a PCM audio frame for recording (called from MicrophoneSource).
+
+        Non-blocking — silently drops if queue full. Audio drops in recording
+        are acceptable; they create a brief silence in the file rather than
+        stalling capture.
+        """
+        if self._audio_queue is None:
+            return
+        try:
+            self._audio_queue.put_nowait(pcm.copy())
+        except asyncio.QueueFull:
+            pass
+
+    @staticmethod
+    def _flush_container(container, video_stream, audio_stream) -> None:
+        """Flush encoder buffers and close the av container. Runs in a thread."""
+        try:
+            if video_stream:
+                for pkt in video_stream.encode(None):
+                    container.mux(pkt)
+            if audio_stream:
+                for pkt in audio_stream.encode(None):
+                    container.mux(pkt)
+            container.close()
+        except Exception as exc:
+            log.warning("Error flushing recording segment: %s", exc)
+
+    async def _close_current_segment(self, closed_at: float) -> None:
+        """Flush the av container off the event loop and register the segment metadata."""
+        if (
+            not self._av_container
+            or self._segment_start_ts is None
+            or self._segment_path is None
+        ):
             return
 
-        self._video_writer.release()
-        self._video_writer = None
+        # Capture state before clearing so the thread call gets stable references.
+        container    = self._av_container
+        video_stream = self._av_video_stream
+        audio_stream = self._av_audio_stream
+        segment_start = self._segment_start_ts
+        path          = self._segment_path
 
-        duration = max(0.0, closed_at - self._segment_start_ts)
+        # Clear immediately so new frames don't try to write into a closing container.
+        self._av_container    = None
+        self._av_video_stream = None
+        self._av_audio_stream = None
+        self._video_pts       = 0
+        self._audio_pts       = 0
+        self._segment_start_ts = None
+        self._segment_path     = None
+
+        # Blocking flush happens in a thread — event loop stays free.
+        await asyncio.to_thread(self._flush_container, container, video_stream, audio_stream)
+
+        duration = max(0.0, closed_at - segment_start)
         if duration <= 0:
             return
 
-        path = self._segment_path
-        self._finalized_segments.append({
-            "name":     os.path.basename(path),
-            "path":     path,
-            "size":     os.path.getsize(path) if os.path.exists(path) else 0,
-            "start_ts": self._segment_start_ts,
-            "end_ts":   closed_at,
-            "duration": duration,
-        })
+        self._finalized_segments.append(
+            {
+                "name":     os.path.basename(path),
+                "path":     path,
+                "size":     os.path.getsize(path) if os.path.exists(path) else 0,
+                "start_ts": segment_start,
+                "end_ts":   closed_at,
+                "duration": duration,
+            }
+        )
         self._finalized_segments.sort(key=lambda seg: seg["start_ts"])
         self._prune_expired_segments(closed_at)
 
@@ -180,41 +247,112 @@ class RecordingManager:
                 log.warning("Skipping unreadable recording: %s", path)
                 continue
 
-            loaded_segments.append({
-                "name":     name,
-                "path":     path,
-                "size":     os.path.getsize(path) if os.path.exists(path) else 0,
-                "start_ts": started_at,
-                "end_ts":   started_at + duration,
-                "duration": duration,
-            })
+            loaded_segments.append(
+                {
+                    "name": name,
+                    "path": path,
+                    "size": os.path.getsize(path) if os.path.exists(path) else 0,
+                    "start_ts": started_at,
+                    "end_ts": started_at + duration,
+                    "duration": duration,
+                }
+            )
 
         self._finalized_segments = sorted(
             loaded_segments,
             key=lambda seg: seg["start_ts"],
         )
         if self._finalized_segments:
-            log.info("Loaded %d existing recording segment(s)", len(self._finalized_segments))
+            log.info(
+                "Loaded %d existing recording segment(s)", len(self._finalized_segments)
+            )
         self._prune_expired_segments()
 
-    def _start_new_segment(self, started_at: float, frame_size: tuple[int, int]) -> None:
-        """Close the old segment (if any) and open a new VideoWriter."""
-        if self._video_writer:
-            self._close_current_segment(started_at)
+    async def _start_new_segment(
+        self, started_at: float, frame_size: tuple[int, int]
+    ) -> None:
+        """Close the old segment (if any) and open a new av container."""
+        if self._av_container:
+            await self._close_current_segment(started_at)
 
         os.makedirs(self.record_path, exist_ok=True)
         self.frame_width, self.frame_height = frame_size
 
         timestamp_str = datetime.fromtimestamp(started_at).strftime("%Y%m%d_%H%M%S")
-        path          = os.path.join(self.record_path, f"{timestamp_str}.mp4")
-        # mp4v is universally supported by OpenCV on all platforms including
-        # Raspberry Pi OS. H.264 (avc1) requires a separate codec license on Pi.
-        fourcc        = cv2.VideoWriter_fourcc(*"mp4v")  # type: ignore[attr-defined]
+        path = os.path.join(self.record_path, f"{timestamp_str}.mp4")
 
-        self._video_writer     = cv2.VideoWriter(path, fourcc, self.fps, frame_size)
+        container = av.open(path, "w", format="mp4")
+
+        # mjpeg (Motion JPEG) encodes each frame independently — no inter-frame
+        # prediction, no motion estimation. This is ~10× faster than mpeg4 at
+        # high resolutions and matches the camera's native MJPG capture format.
+        # Files are larger than mpeg4 but seek perfectly since every frame is a
+        # keyframe. OpenCV and PyAV can both read mjpeg-in-mp4 on all platforms.
+        fps_int = max(1, int(round(self.fps)))
+        vstream = container.add_stream("mjpeg", rate=fps_int)  # video track
+        vstream.width = frame_size[0]
+        vstream.height = frame_size[1]
+        vstream.pix_fmt = "yuvj420p"
+
+        astream = container.add_stream("aac", rate=AUDIO_SAMPLE_RATE)  # audio track
+        astream.layout = "mono" if AUDIO_CHANNELS == 1 else "stereo"
+
+        self._av_container = container
+        self._av_video_stream = vstream
+        self._av_audio_stream = astream
+        self._video_pts = 0
+        self._audio_pts = 0
         self._segment_start_ts = started_at
-        self._segment_path     = path
+        self._segment_path = path
         log.info("Recording segment: %s", path)
+
+    def _write_video_frame(self, bgr_frame: np.ndarray, captured_at: float) -> None:
+        if not self._av_container or not self._av_video_stream or self._segment_start_ts is None:
+            return
+        vframe = av.VideoFrame.from_ndarray(bgr_frame, format="bgr24")
+        vframe = vframe.reformat(format="yuvj420p")
+        # Compute PTS from wall-clock elapsed time so playback speed matches reality
+        # even when the camera drops frames or delivers them late.
+        elapsed = max(0.0, captured_at - self._segment_start_ts)
+        pts = int(elapsed * self.fps)
+        if pts <= self._video_pts:
+            pts = self._video_pts + 1
+        self._video_pts = pts
+        vframe.pts = pts
+        for pkt in self._av_video_stream.encode(vframe):
+            self._av_container.mux(pkt)
+
+    def _write_audio_frame(self, pcm: np.ndarray) -> None:
+        """Write one PCM block (shape: frames×channels) to the av container."""
+        if not self._av_container or not self._av_audio_stream:
+            return
+        # AAC encoder requires fltp (float planar). Convert from int16 directly.
+        # Normalise to [-1.0, 1.0] range that float PCM expects.
+        samples = pcm.shape[0]
+        pcm_float = pcm.astype(np.float32) / 32768.0  # (frames, channels)
+        aframe = av.AudioFrame.from_ndarray(
+            pcm_float.T,  # (channels, frames) — planar layout
+            format="fltp",
+            layout="mono" if AUDIO_CHANNELS == 1 else "stereo",
+        )
+        aframe.pts = self._audio_pts
+        aframe.sample_rate = AUDIO_SAMPLE_RATE
+        self._audio_pts += samples
+        for pkt in self._av_audio_stream.encode(aframe):
+            self._av_container.mux(pkt)
+
+    def _write_frame_and_audio(
+        self, frame: np.ndarray, captured_at: float, audio_frames: list[np.ndarray]
+    ) -> None:
+        """Write one video frame and any batched audio frames. Runs in a thread."""
+        self._write_video_frame(frame, captured_at)
+        for pcm in audio_frames:
+            self._write_audio_frame(pcm)
+
+    def _flush_audio_frames(self, audio_frames: list[np.ndarray]) -> None:
+        """Write audio-only batch (used on timeout ticks). Runs in a thread."""
+        for pcm in audio_frames:
+            self._write_audio_frame(pcm)
 
     def get_timeline(self) -> dict:
         """Return slider-friendly timeline data built from finalized segments.
@@ -228,15 +366,15 @@ class RecordingManager:
         """
         if not self._finalized_segments:
             return {
-                "available":       False,
-                "duration":        0.0,
+                "available": False,
+                "duration": 0.0,
                 "window_start_ts": None,
-                "window_end_ts":   None,
-                "segments":        [],
+                "window_end_ts": None,
+                "segments": [],
             }
 
         window_start = self._finalized_segments[0]["start_ts"]
-        window_end   = self._finalized_segments[-1]["end_ts"]
+        window_end = self._finalized_segments[-1]["end_ts"]
 
         # start_offset / end_offset are seconds from the start of the full
         # recording window, not from epoch. The peer scrubber works in these
@@ -245,20 +383,22 @@ class RecordingManager:
             {
                 **segment,
                 "start_offset": segment["start_ts"] - window_start,
-                "end_offset":   segment["end_ts"]   - window_start,
+                "end_offset": segment["end_ts"] - window_start,
             }
             for segment in self._finalized_segments
         ]
 
         return {
-            "available":       True,
-            "duration":        max(0.0, window_end - window_start),
+            "available": True,
+            "duration": max(0.0, window_end - window_start),
             "window_start_ts": window_start,
-            "window_end_ts":   window_end,
-            "segments":        segments_with_offsets,
+            "window_end_ts": window_end,
+            "segments": segments_with_offsets,
         }
 
-    def resolve_playback_offset(self, offset_seconds: float) -> tuple[dict, float, float] | None:
+    def resolve_playback_offset(
+        self, offset_seconds: float
+    ) -> tuple[dict, float, float] | None:
         """Translate a slider offset (seconds) into a segment and in-file position.
 
         Returns:
@@ -271,7 +411,9 @@ class RecordingManager:
             return None
 
         total_duration = float(timeline["duration"])
-        clamped_offset = max(0.0, min(float(offset_seconds), total_duration))
+        clamped_offset = max(
+            0.0, min(float(offset_seconds), total_duration)
+        )  # pattern: max(low, min(value, high))
 
         for segment in segments:
             if segment["start_offset"] <= clamped_offset <= segment["end_offset"]:
@@ -290,7 +432,9 @@ class RecordingManager:
         """
         timeline = self.get_timeline()
         for index, segment in enumerate(timeline["segments"]):
-            if segment["path"] == current_segment_path and index + 1 < len(timeline["segments"]):
+            if segment["path"] == current_segment_path and index + 1 < len(
+                timeline["segments"]
+            ):
                 return timeline["segments"][index + 1]
         return None
 
@@ -303,59 +447,84 @@ class RecordingManager:
         return None
 
     async def run(self) -> None:
-        """Consume queued frames and write them to rolling MP4 files.
+        """Consume queued frames/audio and write them to rolling MP4 files.
 
         Must be started as an asyncio task before enqueue_frame() is called.
         """
-        # maxsize=240 provides ~8 seconds of buffer at 30 fps.
-        # If the disk can't keep up, frames are dropped by enqueue_frame() rather
-        # than blocking the live camera pipeline.
-        self._load_existing_segments()
+        self._load_existing_segments()  # rebuild timeline from files on disk
+
+        # maxsize=240 provides ~8 seconds of video buffer at 30 fps.
         self._frame_queue = asyncio.Queue(maxsize=240)
-        self._is_running  = True
+        # maxsize=480 provides ~10 seconds of audio buffer at 48 kHz / 960 samples.
+        self._audio_queue = asyncio.Queue(maxsize=480)
+
+        self._is_running = True
         self._ready_event.set()
 
         while self._is_running:
             try:
-                # timeout=1.0 allows the loop to check _is_running periodically
-                # even when no frames arrive (e.g. camera stalled or stopping).
                 frame, captured_at = await asyncio.wait_for(
                     self._frame_queue.get(), timeout=1.0
                 )
                 frame_size = (frame.shape[1], frame.shape[0])
 
-                if self._video_writer is None:
-                    self._start_new_segment(captured_at, frame_size)
+                # write frame to disk
+                if self._av_container is None:
+                    await self._start_new_segment(captured_at, frame_size)
                 elif (
                     self._segment_start_ts is not None
-                    and captured_at - self._segment_start_ts >= self.segment_duration_seconds
+                    and captured_at - self._segment_start_ts
+                    >= self.segment_duration_seconds
                 ):
-                    self._start_new_segment(captured_at, frame_size)
+                    await self._start_new_segment(captured_at, frame_size)
                 elif frame_size != (self.frame_width, self.frame_height):
-                    # Resolution changed mid-stream (e.g. camera reconnected at
-                    # different mode). Rotate so the new file has a consistent size.
                     log.info(
                         "Frame size changed (%sx%s → %sx%s); rotating segment",
-                        self.frame_width, self.frame_height,
-                        frame.shape[1], frame.shape[0],
+                        self.frame_width,
+                        self.frame_height,
+                        frame.shape[1],
+                        frame.shape[0],
                     )
-                    self._start_new_segment(captured_at, frame_size)
+                    await self._start_new_segment(captured_at, frame_size)
 
-                if self._video_writer:
+                # Drain all pending audio before writing so audio/video stay
+                # as close as possible to wall-clock order in the container.
+                audio_frames: list[np.ndarray] = []
+                while True:
                     try:
-                        await asyncio.to_thread(self._video_writer.write, frame)
+                        audio_frames.append(self._audio_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                if self._av_container:
+                    try:
+                        await asyncio.to_thread(
+                            self._write_frame_and_audio, frame, captured_at, audio_frames
+                        )
                     except Exception as exc:
-                        log.error("Failed to write recording frame: %s — stopping recorder", exc)
+                        log.error(
+                            "Failed to write recording frame: %s — stopping recorder",
+                            exc,
+                        )
                         self._is_running = False
 
             except asyncio.TimeoutError:
-                continue
+                # No video frame arrived — still flush any queued audio so
+                # the recording stays in sync when the camera briefly stalls.
+                audio_frames = []
+                while True:
+                    try:
+                        audio_frames.append(self._audio_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                if audio_frames and self._av_container:
+                    try:
+                        await asyncio.to_thread(self._flush_audio_frames, audio_frames)
+                    except Exception as exc:
+                        log.warning("Audio flush error: %s", exc)
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         """Flush the open segment file and stop the recording loop."""
         self._is_running = False
-        if self._video_writer:
-            self._close_current_segment(time.time())
-        self._video_writer     = None
-        self._segment_start_ts = None
-        self._segment_path     = None
+        if self._av_container:
+            await self._close_current_segment(time.time())

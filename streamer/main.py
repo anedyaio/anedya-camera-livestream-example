@@ -111,6 +111,8 @@ def cli() -> None:
     )
     validate_anedya_config()
     display_qr_code()
+
+    # Run the main async function
     asyncio.run(
         main(
             args.camera,

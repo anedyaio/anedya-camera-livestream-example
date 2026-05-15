@@ -78,6 +78,30 @@ def get_int_env(name: str, default: int, minimum: int | None = None) -> int:
         return default
     return value
 
+
+def get_float_env(
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    """Read a float env var with range validation and a safe fallback."""
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        log.warning("Invalid %s=%r; using %.2f", name, raw_value, default)
+        return default
+    if minimum is not None and value < minimum:
+        log.warning("%s=%.2f is below minimum %.2f; using %.2f", name, value, minimum, default)
+        return default
+    if maximum is not None and value > maximum:
+        log.warning("%s=%.2f is above maximum %.2f; using %.2f", name, value, maximum, default)
+        return default
+    return value
+
 MQTT_BROKER    = f"mqtt.{ANEDYA_REGION}.anedya.io"
 MQTT_PORT      = 8883   # TLS port
 MQTT_KEEPALIVE = 60     # seconds between keepalive pings
@@ -149,6 +173,13 @@ MOTION_THRESHOLD_PX = get_int_env("MOTION_THRESHOLD_PX", 1200, minimum=1)
 
 # Seconds between repeated motion-detected log events / triggers.
 MOTION_COOLDOWN_SECONDS = get_int_env("MOTION_COOLDOWN_SECONDS", 5, minimum=0)
+
+# Fraction of frame height (from top) excluded from motion analysis.
+# 0.5 = analyse lower half only (default — avoids sky/ceiling false positives).
+# 0.0 = analyse full frame. 0.25 = skip top quarter only.
+MOTION_ROI_TOP_FRACTION = get_float_env(
+    "MOTION_ROI_TOP_FRACTION", default=0.5, minimum=0.0, maximum=0.95
+)
 
 
 def validate_anedya_config() -> None:

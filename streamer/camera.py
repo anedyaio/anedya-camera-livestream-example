@@ -16,13 +16,13 @@ Also contains:
 """
 
 import asyncio
-from dataclasses import dataclass
 import logging
 import platform
 import re
 import shutil
 import subprocess
 import time
+from dataclasses import dataclass
 from datetime import datetime
 
 import cv2
@@ -30,8 +30,8 @@ import numpy as np
 
 from config import (
     CAPTURE_RESOLUTION_CANDIDATES,
-    MOTION_ANALYSIS_WIDTH,
     MOTION_ANALYSIS_HEIGHT,
+    MOTION_ANALYSIS_WIDTH,
 )
 from recording import RecordingManager
 
@@ -43,6 +43,8 @@ class CameraMode:
     width: int
     height: int
     fps: float
+
+    # Four-character code identifying the video compression format (codec)
     fourcc: str
 
 
@@ -55,12 +57,12 @@ def _normalize_fourcc(value: object) -> str:
     return text[:4]
 
 
+# TODO : Choose what CPU can handle.
 def _choose_best_mode(modes: list[CameraMode], target_fps: float) -> CameraMode | None:
     # Prefer modes that meet the requested FPS, then maximize captured pixels.
     # This keeps live streaming and recording on the same highest usable source.
     candidates = [
-        mode for mode in modes
-        if target_fps <= 0 or mode.fps >= target_fps
+        mode for mode in modes if target_fps <= 0 or mode.fps >= target_fps
     ] or modes
     if not candidates:
         return None
@@ -108,6 +110,7 @@ def _ffmpeg_exe() -> str | None:
         return ffmpeg
     try:
         import imageio_ffmpeg
+
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return None
@@ -123,7 +126,9 @@ def _windows_camera_name(ffmpeg: str, camera_index: int) -> str | None:
     )
     devices = [
         match.group(1)
-        for match in re.finditer(r'"([^"]+)"\s+\(video\)', result.stderr + result.stdout)
+        for match in re.finditer(
+            r'"([^"]+)"\s+\(video\)', result.stderr + result.stdout
+        )
     ]
     return devices[camera_index] if 0 <= camera_index < len(devices) else None
 
@@ -175,7 +180,9 @@ def _windows_camera_modes(camera_index: int) -> list[CameraMode]:
     return modes
 
 
-def discover_best_camera_mode(camera_index: int, target_fps: float) -> CameraMode | None:
+def discover_best_camera_mode(
+    camera_index: int, target_fps: float
+) -> CameraMode | None:
     """Discover the best camera mode before falling back to OpenCV probing."""
     system = platform.system()
     if system == "Linux":
@@ -189,7 +196,10 @@ def discover_best_camera_mode(camera_index: int, target_fps: float) -> CameraMod
     if mode:
         log.info(
             "Selected camera mode from capabilities: %dx%d @ %.1f fps %s",
-            mode.width, mode.height, mode.fps, mode.fourcc,
+            mode.width,
+            mode.height,
+            mode.fps,
+            mode.fourcc,
         )
     return mode
 
@@ -227,32 +237,32 @@ def configure_camera_max_resolution(
         actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or mode.fps)
         return actual_width, actual_height, actual_fps
 
-    best_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 0)
+    best_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     best_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    best_area   = best_width * best_height
+    best_area = best_width * best_height
 
     cap.set(cv2.CAP_PROP_FPS, target_fps)
 
     for requested_width, requested_height in CAPTURE_RESOLUTION_CANDIDATES:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  requested_width)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_height)
 
-        actual_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 0)
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
         actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        actual_area   = actual_width * actual_height
+        actual_area = actual_width * actual_height
 
         if actual_area > best_area:
-            best_width  = actual_width
+            best_width = actual_width
             best_height = actual_height
-            best_area   = actual_area
+            best_area = actual_area
 
         # Driver returned at least the requested size — this is the highest
         # supported mode. Higher candidates in the list would just be clamped
         # back down to this, so stop here.
         if actual_width >= requested_width and actual_height >= requested_height:
-            best_width  = actual_width
+            best_width = actual_width
             best_height = actual_height
-            break
+            break  # driver gave us what we asked for — this is the max
 
     actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or target_fps)
     return best_width, best_height, actual_fps
@@ -269,8 +279,8 @@ def draw_status_overlay(
     readable on both light and dark scenes.
     """
     timestamp_text = datetime.fromtimestamp(captured_at).strftime("%Y-%m-%d %H:%M:%S")
-    font      = cv2.FONT_HERSHEY_SIMPLEX
-    scale     = 0.55
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    scale = 0.55
     thickness = 1
 
     margin_x = max(12, int(frame.shape[1] * 0.015))
@@ -280,14 +290,25 @@ def draw_status_overlay(
     x = margin_x
     y = frame.shape[0] - margin_y
 
+    # black background
     cv2.rectangle(
         frame,
-        (x - 6,          y - text_h - 6),
+        (x - 6, y - text_h - 6),
         (x + text_w + 6, y + baseline + 6),
         (0, 0, 0),
         -1,
     )
-    cv2.putText(frame, timestamp_text, (x, y), font, scale, (255, 255, 255), thickness, cv2.LINE_AA)
+    # white text
+    cv2.putText(
+        frame,
+        timestamp_text,
+        (x, y),
+        font,
+        scale,
+        (255, 255, 255),
+        thickness,
+        cv2.LINE_AA,
+    )
 
     if measured_fps is not None:
         height, width = frame.shape[:2]
@@ -298,7 +319,7 @@ def draw_status_overlay(
 
         cv2.rectangle(
             frame,
-            (fps_x - 6,         fps_y - fps_h - 6),
+            (fps_x - 6, fps_y - fps_h - 6),
             (fps_x + fps_w + 6, fps_y + fps_baseline + 6),
             (0, 0, 0),
             -1,
@@ -333,32 +354,37 @@ class CameraSource:
         self,
         camera_index: int,
         recorder: RecordingManager,
-        analysis_width:  int   = MOTION_ANALYSIS_WIDTH,
-        analysis_height: int   = MOTION_ANALYSIS_HEIGHT,
-        fps:             float = 60.0,
+        analysis_width: int = MOTION_ANALYSIS_WIDTH,
+        analysis_height: int = MOTION_ANALYSIS_HEIGHT,
+        fps: float = 60.0,
         enable_motion_detection: bool = False,
-        motion_threshold_px: int   = 1200,
-        motion_cooldown:     float = 5.0,
+        motion_threshold_px: int = 1200,
+        motion_cooldown: float = 5.0,
+        motion_roi_top_fraction: float = 0.5,
     ):
-        self.camera_index    = camera_index
-        self.recorder        = recorder
-        self.analysis_width  = analysis_width
+        self.camera_index = camera_index
+        self.recorder = recorder
+        self.analysis_width = analysis_width
         self.analysis_height = analysis_height
-        self.fps             = fps
+        self.fps = fps
         self.enable_motion_detection = enable_motion_detection
-        self._motion_threshold_px    = motion_threshold_px
-        self._motion_cooldown_init   = motion_cooldown
+        self._motion_threshold_px = motion_threshold_px
+        self._motion_cooldown_init = motion_cooldown
+        # Clamp to [0.0, 0.95] — 0.95 leaves at least 5% of frame for analysis.
+        self._motion_roi_top_fraction = max(0.0, min(0.95, motion_roi_top_fraction))
 
         system = platform.system()
         if system == "Windows":
-            backend = cv2.CAP_DSHOW
+            backend = cv2.CAP_DSHOW  # DirectShow
         else:
-            backend = cv2.CAP_V4L2
+            backend = cv2.CAP_V4L2  # Video4Linux2
 
         self.cap = cv2.VideoCapture(camera_index, backend)
         self.cap.set(
             cv2.CAP_PROP_FOURCC,
-            cv2.VideoWriter_fourcc(*"MJPG"),
+            cv2.VideoWriter_fourcc(
+                *"MJPG"
+            ),  # convert the string `"MJPG"` into a 32-bit integer the driver understands
         )
 
         if not self.cap.isOpened():
@@ -372,28 +398,34 @@ class CameraSource:
             self.recorder.fps = self.capture_fps
         log.info(
             "Camera %d opened: %dx%d @ %.1f fps",
-            camera_index, self.capture_width, self.capture_height, self.capture_fps,
+            camera_index,
+            self.capture_width,
+            self.capture_height,
+            self.capture_fps,
         )
 
         # detectShadows=False improves performance and avoids shadows being
         # classified as foreground, which would cause false motion events.
+        # MOG2 = Mixture of Gaussians 2. Learns what "background" looks like over time.
+        # Anything that doesn't match the learned background = foreground = potential motion.
+        # `detectShadows=False` = shadows are treated as background (otherwise shadows trigger false motion alerts).
         self._background_subtractor = (
             cv2.createBackgroundSubtractorMOG2(detectShadows=False)
             if self.enable_motion_detection
             else None
         )
-        self._motion_cooldown       = self._motion_cooldown_init
-        self._last_motion_trigger   = 0.0
+        self._motion_cooldown = self._motion_cooldown_init
+        self._last_motion_trigger = 0.0
 
         # asyncio.Condition lets N viewer tracks all wait for the same new frame
         # without consuming it. A queue would require one queue per viewer.
-        self._frame_condition   = asyncio.Condition()
-        self._frame_sequence    = 0
-        self._latest_frame:     np.ndarray | None = None
-        self._latest_timestamp: float             = 0.0
-        self._measured_fps:     float | None      = None
+        self._frame_condition = asyncio.Condition()
+        self._frame_sequence = 0
+        self._latest_frame: np.ndarray | None = None
+        self._latest_timestamp: float = 0.0
+        self._measured_fps: float | None = None
         self._fps_window_started_at = time.monotonic()
-        self._fps_window_frames     = 0
+        self._fps_window_frames = 0
 
         self._is_running = False
         self._capture_task: asyncio.Task | None = None
@@ -401,7 +433,7 @@ class CameraSource:
     async def start(self) -> None:
         """Start the background capture loop."""
         if self._capture_task is None:
-            self._is_running   = True
+            self._is_running = True
             self._capture_task = asyncio.create_task(self._capture_loop())
 
     def _process_raw_frame(self, raw_frame: np.ndarray) -> tuple[np.ndarray, float]:
@@ -414,17 +446,19 @@ class CameraSource:
 
         # Assert that the background subtractor is initialized.
         assert self._background_subtractor is not None
-        
-        analysis_frame = cv2.resize(raw_frame, (self.analysis_width, self.analysis_height))
 
-        # Use only the lower half of the frame for motion detection.
-        # The upper half often contains sky or ceiling whose brightness changes
-        # due to lighting conditions, causing false-positive motion events.
-        roi_y_start = self.analysis_height // 2
-        roi         = analysis_frame[roi_y_start:self.analysis_height, 0:self.analysis_width]
+        analysis_frame = cv2.resize(
+            raw_frame, (self.analysis_width, self.analysis_height)
+        )  # shrink for speed
 
-        gray   = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (3, 3), 0)
-        mask   = self._background_subtractor.apply(gray)
+        # Skip the top fraction of the frame for motion detection.
+        # Sky/ceiling brightness shifts cause false positives; configurable via
+        # MOTION_ROI_TOP_FRACTION (0.0 = full frame, 0.5 = lower half only).
+        roi_y_start = int(self.analysis_height * self._motion_roi_top_fraction)
+        roi = analysis_frame[roi_y_start:, :]
+
+        gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (3, 3), 0)
+        mask = self._background_subtractor.apply(gray)
         # Threshold the raw subtractor output to a clean binary mask.
         # Values below 200 are uncertain background; keep only high-confidence foreground.
         _, binary_mask = cv2.threshold(mask, 200, 255, cv2.THRESH_BINARY)
@@ -434,11 +468,15 @@ class CameraSource:
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel)
 
-        contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
 
         # 1200 px² threshold on the downscaled analysis frame filters out small
         # noise blobs. Adjust this value to tune sensitivity (lower = more sensitive).
-        motion_contours = [c for c in contours if cv2.contourArea(c) > self._motion_threshold_px]
+        motion_contours = [
+            c for c in contours if cv2.contourArea(c) > self._motion_threshold_px
+        ]
 
         now = time.time()
 
@@ -449,9 +487,9 @@ class CameraSource:
 
             # Scale bounding boxes back from analysis-ROI coordinates to
             # full-resolution frame coordinates before drawing.
-            scale_x      = raw_frame.shape[1] / self.analysis_width
-            scale_y      = raw_frame.shape[0] / self.analysis_height
-            roi_y_offset = self.analysis_height // 2
+            scale_x = raw_frame.shape[1] / self.analysis_width
+            scale_y = raw_frame.shape[0] / self.analysis_height
+            roi_y_offset = int(self.analysis_height * self._motion_roi_top_fraction)
 
             for contour in motion_contours:
                 x, y, w, h = cv2.boundingRect(contour)
@@ -487,32 +525,43 @@ class CameraSource:
             self._update_measured_fps()
 
             # CPU-intensive OpenCV processing runs in a thread to keep event loop free.
-            annotated_frame, now = await asyncio.to_thread(self._process_raw_frame, raw_frame)
+            annotated_frame, now = await asyncio.to_thread(
+                self._process_raw_frame, raw_frame
+            )
 
             # copy() so the recorder and the Condition share independent buffers —
             # if the live viewer modifies the frame later it won't corrupt the recording.
             self.recorder.enqueue_frame(annotated_frame.copy(), now)
 
             async with self._frame_condition:
-                self._latest_frame     = annotated_frame
+                self._latest_frame = annotated_frame
                 self._latest_timestamp = now
-                self._frame_sequence  += 1
-                self._frame_condition.notify_all()
+                self._frame_sequence += 1
+                self._frame_condition.notify_all()  # wake ALL waiting viewers
 
-            elapsed    = time.monotonic() - loop_start
+            elapsed = time.monotonic() - loop_start
             sleep_time = max(0.0, frame_interval - elapsed)
-            await asyncio.sleep(sleep_time)
+            await asyncio.sleep(sleep_time)  # pace to target FPS
 
-    async def get_next_frame(self, last_known_sequence: int) -> tuple[int, np.ndarray, float]:
+    async def get_next_frame(
+        self, last_known_sequence: int
+    ) -> tuple[int, np.ndarray, float]:
         """Wait until a frame newer than last_known_sequence is available.
 
         Returns:
             (new_sequence, frame_copy, captured_at)
         """
         async with self._frame_condition:
-            while self._latest_frame is None or self._frame_sequence <= last_known_sequence:
+            while (
+                self._latest_frame is None
+                or self._frame_sequence <= last_known_sequence
+            ):
                 await self._frame_condition.wait()
-            return self._frame_sequence, self._latest_frame.copy(), self._latest_timestamp
+            return (
+                self._frame_sequence,
+                self._latest_frame.copy(),
+                self._latest_timestamp,
+            )
 
     async def stop(self) -> None:
         """Stop the capture loop and release the camera device."""

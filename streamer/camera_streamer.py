@@ -23,9 +23,15 @@ import asyncio
 import json
 import logging
 import ssl
+from concurrent.futures import Future
 
 import paho.mqtt.client as mqtt_lib
-from aiortc import RTCConfiguration, RTCIceServer, RTCPeerConnection, RTCSessionDescription
+from aiortc import (
+    RTCConfiguration,
+    RTCIceServer,
+    RTCPeerConnection,
+    RTCSessionDescription,
+)
 
 from camera import CameraSource
 from config import (
@@ -33,25 +39,26 @@ from config import (
     ANEDYA_CONNECTION_KEY,
     ANEDYA_DEVICE_ID,
     ANEDYA_NODE_ID,
+    HEARTBEAT_INTERVAL_SECONDS,
+    MOTION_ANALYSIS_HEIGHT,
+    MOTION_ANALYSIS_WIDTH,
+    MOTION_COOLDOWN_SECONDS,
+    MOTION_ROI_TOP_FRACTION,
+    MOTION_THRESHOLD_PX,
     MQTT_BROKER,
     MQTT_KEEPALIVE,
     MQTT_PORT,
+    RECORDING_RETENTION_SECONDS,
+    RECORDING_SEGMENT_SECONDS,
     TOPIC_ERRORS,
+    TOPIC_HEARTBEAT,
     TOPIC_RESPONSES,
     TOPIC_VALUESTORE_SET,
     TOPIC_VALUESTORE_UPDATES,
-    TOPIC_HEARTBEAT,
-    HEARTBEAT_INTERVAL_SECONDS,
-    RECORDING_SEGMENT_SECONDS,
-    RECORDING_RETENTION_SECONDS,
-    MOTION_ANALYSIS_WIDTH,
-    MOTION_ANALYSIS_HEIGHT,
-    MOTION_THRESHOLD_PX,
-    MOTION_COOLDOWN_SECONDS,
 )
+from audio import MicrophoneSource
 from recording import RecordingManager
-from tracks import MicrophoneAudioTrack, MicrophoneSource, WebcamTrack
-from concurrent.futures import Future
+from tracks import DvrAudioTrack, WebcamTrack
 
 log = logging.getLogger("streamer")
 
@@ -72,13 +79,13 @@ def build_turn_ice_servers(
     sides share the same relay session, which is required for the TURN server
     to allow traffic between them.
     """
-    _ = turn_endpoint  # TODO: use to support multiple Anedya regions
+    _ = turn_endpoint  # TODO: use this instead of the hardcoded URL
     return [
         RTCIceServer(urls=["stun:turn1.ap-in-1.anedya.io:3478"]),
         RTCIceServer(
-            urls       = ["turn:turn1.ap-in-1.anedya.io:3478"],
-            username   = username,
-            credential = credential,
+            urls=["turn:turn1.ap-in-1.anedya.io:3478"],
+            username=username,
+            credential=credential,
         ),
     ]
 
@@ -105,24 +112,26 @@ class CameraStreamer:
         self,
         camera_index: int,
         enable_audio: bool = True,
-        record_path:  str  = "recordings",
+        record_path: str = "recordings",
         enable_motion_detection: bool = False,
     ):
         self.camera_index = camera_index
         self.enable_audio = enable_audio
         self.enable_motion_detection = enable_motion_detection
 
-        self._active_peers: dict[str, dict]              = {}
-        self._event_loop:   asyncio.AbstractEventLoop | None = None
-        self._mqtt_client:  mqtt_lib.Client | None       = None
+        # session_id -> {"pc": <RTCPeerConnection>, "video": <WebcamTrack>, "audio": <DvrAudioTrack>}
+        self._active_peers: dict[str, dict] = {}
+
+        self._event_loop: asyncio.AbstractEventLoop | None = None
+        self._mqtt_client: mqtt_lib.Client | None = None
 
         self.recorder = RecordingManager(
             record_path=record_path,
             segment_duration_seconds=RECORDING_SEGMENT_SECONDS,
             retention_seconds=RECORDING_RETENTION_SECONDS,
         )
-        self.source:   CameraSource | None = None
-        self.audio_source: MicrophoneSource | None = None
+        self.source: CameraSource | None = None  # Camera source
+        self.audio_source: MicrophoneSource | None = None  # Audio source
 
         self._heartbeat_task: Future | None = None
 
@@ -131,7 +140,9 @@ class CameraStreamer:
         while True:
             if self._mqtt_client:
                 try:
-                    result = self._mqtt_client.publish(TOPIC_HEARTBEAT, json.dumps({}), qos=1)
+                    result = self._mqtt_client.publish(
+                        TOPIC_HEARTBEAT, json.dumps({}), qos=1
+                    )
                     if result.rc != mqtt_lib.MQTT_ERR_SUCCESS:
                         log.warning("Heartbeat publish failed rc=%s", result.rc)
                     else:
@@ -167,10 +178,10 @@ class CameraStreamer:
 
         client.reconnect_delay_set(min_delay=1, max_delay=30)
 
-        client.on_connect    = self._on_mqtt_connect
-        client.on_message    = self._on_mqtt_message
+        client.on_connect = self._on_mqtt_connect
+        client.on_message = self._on_mqtt_message
         client.on_disconnect = self._on_mqtt_disconnect
-        client.on_subscribe  = lambda _c, _u, mid, granted_qos: log.info(
+        client.on_subscribe = lambda _c, _u, mid, granted_qos: log.info(
             "Subscribed (mid=%d, qos=%s)", mid, granted_qos
         )
 
@@ -194,12 +205,10 @@ class CameraStreamer:
 
             # Start heartbeat once connection is live
             if (
-                self._heartbeat_task is None
-                or self._heartbeat_task.done()
+                self._heartbeat_task is None or self._heartbeat_task.done()
             ) and self._event_loop:
                 self._heartbeat_task = asyncio.run_coroutine_threadsafe(
-                    self._heartbeat_loop(),
-                    self._event_loop
+                    self._heartbeat_loop(), self._event_loop
                 )
         else:
             reason = self._MQTT_RETURN_CODES.get(rc, f"unknown (rc={rc})")
@@ -207,7 +216,9 @@ class CameraStreamer:
 
     def _on_mqtt_disconnect(self, _client, _userdata, rc) -> None:
         if rc != 0:
-            log.warning("MQTT disconnected (rc=%d) — paho will reconnect with backoff", rc)
+            log.warning(
+                "MQTT disconnected (rc=%d) — paho will reconnect with backoff", rc
+            )
 
     def _on_mqtt_message(self, _client, _userdata, message) -> None:
         try:
@@ -237,7 +248,7 @@ class CameraStreamer:
             log.info("Value-store update ignored (key=%r)", key)
             return
 
-        session_id = key[len("offer_"):]
+        session_id = key[len("offer_") :]
         log.info("Incoming WebRTC offer (session=%s)", session_id)
         assert self._event_loop is not None
 
@@ -246,19 +257,24 @@ class CameraStreamer:
             self._event_loop,
         )
         future.add_done_callback(
-            lambda f: log.error("_handle_offer raised: %s", f.exception())
-            if f.exception() else None
+            lambda f: (
+                log.error("_handle_offer raised: %s", f.exception())
+                if f.exception()
+                else None
+            )
         )
 
     def _write_to_valuestore(self, key: str, value: str) -> None:
         """Publish a string value to the Anedya value store over MQTT."""
         assert self._mqtt_client is not None
-        message = json.dumps({
-            "reqId": "", 
-            "key":   key,
-            "value": value,
-            "type":  "string",
-        })
+        message = json.dumps(
+            {
+                "reqId": "",
+                "key": key,
+                "value": value,
+                "type": "string",
+            }
+        )
         self._mqtt_client.publish(TOPIC_VALUESTORE_SET, message, qos=1)
         log.debug("Value-store write: namespace=node/%s key=%s", ANEDYA_NODE_ID, key)
 
@@ -275,7 +291,7 @@ class CameraStreamer:
           7. Publish the final answer SDP to the value store.
         """
         try:
-            data      = json.loads(raw_value)
+            data = json.loads(raw_value)
             offer_sdp = data["offer"]
         except Exception as exc:
             log.error("Malformed offer payload (session=%s): %s", session_id, exc)
@@ -288,6 +304,7 @@ class CameraStreamer:
             log.error("No TURN credentials in offer (session=%s)", session_id)
             return
 
+        # Build the ICE server list from the offer data
         try:
             ice_servers = build_turn_ice_servers(
                 turn_data["endpoint"],
@@ -298,51 +315,69 @@ class CameraStreamer:
             log.error("Invalid TURN data in offer (session=%s): %s", session_id, exc)
             return
 
+        # Check if the camera source is ready
         if self.source is None:
-            log.error("Camera source not ready — cannot handle offer (session=%s)", session_id)
+            log.error(
+                "Camera source not ready — cannot handle offer (session=%s)", session_id
+            )
             return
 
+        # Check if the session is already active
         if session_id in self._active_peers:
-            log.warning("Session %s already active — closing stale connection", session_id)
+            log.warning(
+                "Session %s already active — closing stale connection", session_id
+            )
             await self._close_peer_session(session_id)
 
+        # Create the peer connection
         peer_connection = RTCPeerConnection(
             configuration=RTCConfiguration(iceServers=ice_servers)
         )
+
+        # Create video + audio tracks for THIS viewer
         video_track = WebcamTrack(self.source, self.recorder)
+        # DvrAudioTrack` gets a reference to `video_track`. Audio never decides its own mode — 
+        # it just reads `video_track.mode` every frame and follows it. Video is the authority.
         audio_track = (
-            MicrophoneAudioTrack(self.audio_source)
+            DvrAudioTrack(self.audio_source, video_track)
             if self.enable_audio and self.audio_source
             else None
         )
 
+        # Store and attach tracks to connection
         self._active_peers[session_id] = {
-            "pc":    peer_connection,
+            "pc": peer_connection,
             "video": video_track,
             "audio": audio_track,
         }
-
         peer_connection.addTrack(video_track)
         if audio_track:
             peer_connection.addTrack(audio_track)
 
+        # Register event handlers
         @peer_connection.on("datachannel")
         def on_data_channel(channel):
-            log.info("DataChannel opened (session=%s, label=%s)", session_id, channel.label)
+            log.info(
+                "DataChannel opened (session=%s, label=%s)", session_id, channel.label
+            )
 
             def push_timeline_to_peer() -> None:
-                timeline        = self.recorder.get_timeline()
+                timeline = self.recorder.get_timeline()
                 playback_offset = video_track.current_playback_offset()
                 # In live mode report the slider at the far-right (end of recording).
                 # The peer UI uses this to position the scrubber at "now".
                 if video_track.mode == "live":
                     playback_offset = timeline["duration"]
-                channel.send(json.dumps({
-                    "type":            "timeline",
-                    "mode":            video_track.mode,
-                    "playback_offset": playback_offset,
-                    **timeline,
-                }))
+                channel.send(
+                    json.dumps(
+                        {
+                            "type": "timeline",
+                            "mode": video_track.mode,
+                            "playback_offset": playback_offset,
+                            **timeline,
+                        }
+                    )
+                )
 
             @channel.on("message")
             def on_channel_message(raw_message):
@@ -359,10 +394,14 @@ class CameraStreamer:
                     if video_track.seek(offset):
                         push_timeline_to_peer()
                     else:
-                        channel.send(json.dumps({
-                            "type":    "error",
-                            "message": "No recording available at selected time",
-                        }))
+                        channel.send(
+                            json.dumps(
+                                {
+                                    "type": "error",
+                                    "message": "No recording available at selected time",
+                                }
+                            )
+                        )
                 elif action == "live":
                     video_track.go_live()
                     push_timeline_to_peer()
@@ -381,6 +420,9 @@ class CameraStreamer:
             if peer_connection.connectionState in ("failed", "closed"):
                 await self._close_peer_session(session_id)
 
+        # SDP handshake.
+        # SDP = Session Description Protocol.
+        # A text blob that describes "I can send H.264 video, Opus audio, here are my network candidates."
         await peer_connection.setRemoteDescription(
             RTCSessionDescription(sdp=offer_sdp["sdp"], type=offer_sdp["type"])
         )
@@ -406,10 +448,13 @@ class CameraStreamer:
                     session_id,
                 )
 
-        answer_payload = json.dumps({
-            "sdp":  peer_connection.localDescription.sdp,
-            "type": peer_connection.localDescription.type,
-        })
+        # Publish the answer to the value store
+        answer_payload = json.dumps(
+            {
+                "sdp": peer_connection.localDescription.sdp,
+                "type": peer_connection.localDescription.type,
+            }
+        )
         self._write_to_valuestore(f"answer_{session_id}", answer_payload)
         log.info("Answer published to value store (session=%s)", session_id)
 
@@ -427,14 +472,19 @@ class CameraStreamer:
 
     async def run(self) -> None:
         """Start all subsystems and block until a shutdown signal is received."""
-        self._event_loop = asyncio.get_event_loop()
+        self._event_loop = asyncio.get_event_loop()  # grab the event loop reference
         self._connect_to_mqtt_broker()
 
         # Recorder must be running before the camera source starts so that
         # the very first frames are not dropped while the queue is being created.
-        asyncio.create_task(self.recorder.run())
-        await self.recorder.wait_until_ready()
+        asyncio.create_task(
+            self.recorder.run()
+        )  # fire and forget — recorder runs forever in background
+        await (
+            self.recorder.wait_until_ready()
+        )  # camera can't start before recorder is ready
 
+        # Create the camera source
         source = CameraSource(
             self.camera_index,
             self.recorder,
@@ -443,12 +493,14 @@ class CameraStreamer:
             enable_motion_detection=self.enable_motion_detection,
             motion_threshold_px=MOTION_THRESHOLD_PX,
             motion_cooldown=float(MOTION_COOLDOWN_SECONDS),
+            motion_roi_top_fraction=MOTION_ROI_TOP_FRACTION,
         )
-        await source.start()
+        await source.start()  # start the camera source capture loop in background
 
+        # Create and start audio source if enabled
         if self.enable_audio:
             try:
-                self.audio_source = MicrophoneSource()
+                self.audio_source = MicrophoneSource(recorder=self.recorder)
                 self.audio_source.start()
             except Exception as exc:
                 self.enable_audio = False
@@ -457,6 +509,8 @@ class CameraStreamer:
 
         self.source = source
         log.info("Streamer running — recording started, waiting for peers")
+
+        # Main loop: wait for peers to connect and handle them
         try:
             while True:
                 await asyncio.sleep(1)
@@ -476,7 +530,7 @@ class CameraStreamer:
             self.audio_source.release()
             self.audio_source = None
 
-        self.recorder.stop()
+        await self.recorder.stop()
 
         if self._heartbeat_task:
             canceled = self._heartbeat_task.cancel()
