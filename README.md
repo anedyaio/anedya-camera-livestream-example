@@ -1,10 +1,13 @@
 [<img src="https://img.shields.io/badge/Anedya-Documentation-blue?style=for-the-badge">](https://docs.anedya.io?utm_source=github&utm_medium=link&utm_campaign=github-examples&utm_content=pi-cam)
 
-# Pi Cam - CCTV Camera with Anedya + WebRTC
 
 <p align="center">
     <img src="https://cdn.anedya.io/anedya_black_banner.png" alt="Logo">
 </p>
+
+# Pi Cam - CCTV Camera with Anedya + WebRTC
+
+![Camera View](./assets/camera_view.png)
 
 Turn a Raspberry Pi into a CCTV-style camera system using Anedya for signaling and TURN relay provisioning, and WebRTC for real-time video delivery.
 
