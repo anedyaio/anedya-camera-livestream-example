@@ -52,6 +52,7 @@ from config import (
     RECORDING_SEGMENT_SECONDS,
     TOPIC_ERRORS,
     TOPIC_HEARTBEAT,
+    TOPIC_LOGS,
     TOPIC_RESPONSES,
     TOPIC_VALUESTORE_SET,
     TOPIC_VALUESTORE_UPDATES,
@@ -61,6 +62,29 @@ from recording import RecordingManager
 from tracks import DvrAudioTrack, WebcamTrack
 
 log = logging.getLogger("streamer")
+
+_LOG_MAX_CHARS = 1000
+
+
+class AnedyaLogHandler(logging.Handler):
+    """Forwards log records to Anedya via MQTT after connection is established."""
+
+    def __init__(self, mqtt_client: mqtt_lib.Client) -> None:
+        super().__init__()
+        self._mqtt_client = mqtt_client
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+            if len(message) > _LOG_MAX_CHARS:
+                message = message[:_LOG_MAX_CHARS]
+            payload = json.dumps({
+                "reqId": "",
+                "data": [{"timestamp": int(record.created * 1000), "log": message}],
+            })
+            self._mqtt_client.publish(TOPIC_LOGS, payload, qos=0)
+        except Exception:
+            self.handleError(record)
 
 
 def build_turn_ice_servers(
@@ -134,6 +158,8 @@ class CameraStreamer:
         self.audio_source: MicrophoneSource | None = None  # Audio source
 
         self._heartbeat_task: Future | None = None
+        self._anedya_log_handler: AnedyaLogHandler | None = None
+        self._mqtt_connected_event: asyncio.Event | None = None
 
     async def _heartbeat_loop(self) -> None:
         """Periodically publish device heartbeat to Anedya."""
@@ -203,6 +229,19 @@ class CameraStreamer:
             client.subscribe(TOPIC_RESPONSES)
             client.subscribe(TOPIC_ERRORS)
 
+            # Install log forwarding handler (idempotent on reconnect)
+            if self._anedya_log_handler is None:
+                handler = AnedyaLogHandler(client)
+                handler.setFormatter(
+                    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+                )
+                logging.getLogger().addHandler(handler)
+                self._anedya_log_handler = handler
+
+            # Signal run() to start camera/recorder/audio
+            if self._event_loop and self._mqtt_connected_event:
+                self._event_loop.call_soon_threadsafe(self._mqtt_connected_event.set)
+
             # Start heartbeat once connection is live
             if (
                 self._heartbeat_task is None or self._heartbeat_task.done()
@@ -230,7 +269,8 @@ class CameraStreamer:
         if message.topic == TOPIC_VALUESTORE_UPDATES:
             self._handle_valuestore_update(payload)
         elif message.topic == TOPIC_RESPONSES:
-            log.info("MQTT response: %s", payload)
+            if not payload.get("success", True):
+                log.warning("MQTT response error: %s", payload)
         elif message.topic == TOPIC_ERRORS:
             log.error("MQTT error: %s", payload)
 
@@ -472,8 +512,12 @@ class CameraStreamer:
 
     async def run(self) -> None:
         """Start all subsystems and block until a shutdown signal is received."""
-        self._event_loop = asyncio.get_event_loop()  # grab the event loop reference
+        self._event_loop = asyncio.get_event_loop()
+        self._mqtt_connected_event = asyncio.Event()
         self._connect_to_mqtt_broker()
+
+        log.info("Waiting for MQTT connection before starting subsystems...")
+        await self._mqtt_connected_event.wait()
 
         # Recorder must be running before the camera source starts so that
         # the very first frames are not dropped while the queue is being created.
@@ -536,6 +580,10 @@ class CameraStreamer:
             canceled = self._heartbeat_task.cancel()
             log.info("Heartbeat task canceled: %s", canceled)
             self._heartbeat_task = None
+
+        if self._anedya_log_handler:
+            logging.getLogger().removeHandler(self._anedya_log_handler)
+            self._anedya_log_handler = None
 
         if self._mqtt_client:
             self._mqtt_client.loop_stop()

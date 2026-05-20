@@ -128,6 +128,7 @@ TOPIC_VALUESTORE_SET     = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/setVal
 TOPIC_RESPONSES          = f"$anedya/device/{ANEDYA_DEVICE_ID}/response"
 TOPIC_ERRORS             = f"$anedya/device/{ANEDYA_DEVICE_ID}/errors"
 TOPIC_HEARTBEAT          = f"$anedya/device/{ANEDYA_DEVICE_ID}/heartbeat/json"
+TOPIC_LOGS               = f"$anedya/device/{ANEDYA_DEVICE_ID}/logs/submitLogs/json"
 HEARTBEAT_INTERVAL_SECONDS = MQTT_KEEPALIVE
 
 RECORDING_SEGMENT_SECONDS = get_int_env("RECORDING_SEGMENT_SECONDS", 5, minimum=1)
