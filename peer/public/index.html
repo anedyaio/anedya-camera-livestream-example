@@ -253,10 +253,12 @@
   </div>
 
   <div class="toggle-row">
+    <!--
     <label class="toggle">
       <input id="relayOnlyToggle" type="checkbox" />
       <span>Force relay/TURN only</span>
     </label>
+    -->
     <label class="toggle">
       <input id="muteToggle" type="checkbox" />
       <span>Mute audio</span>
@@ -373,13 +375,15 @@
     }
 
     function relayOnlyEnabled() {
-      return relayOnlyToggle.checked;
+      return relayOnlyToggle?.checked ?? false;
     }
 
     function syncSettingsUI() {
       nodeIdInput.value = localStorage.getItem(STORAGE_KEYS.nodeId) || '';
       apiKeyInput.value = localStorage.getItem(STORAGE_KEYS.apiKey) || '';
-      relayOnlyToggle.checked = localStorage.getItem(STORAGE_KEYS.relayOnly) === 'true';
+      if (relayOnlyToggle) {
+        relayOnlyToggle.checked = localStorage.getItem(STORAGE_KEYS.relayOnly) === 'true';
+      }
     }
 
     function formatTime(totalSeconds) {
@@ -624,12 +628,14 @@
       } else {
         localStorage.removeItem(STORAGE_KEYS.apiKey);
       }
-      localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
-      uiLog(`Settings saved (${nodeId ? 'node set' : 'node missing'}, ${value ? 'key set' : 'key missing'}, relay ${relayOnlyToggle.checked ? 'forced' : 'auto'})`);
+      if (relayOnlyToggle) {
+        localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
+      }
+      uiLog(`Settings saved (${nodeId ? 'node set' : 'node missing'}, ${value ? 'key set' : 'key missing'})`);
       settingsPanel.style.display = 'none';
     });
 
-    relayOnlyToggle.addEventListener('change', () => {
+    relayOnlyToggle?.addEventListener('change', () => {
       localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
     });
 

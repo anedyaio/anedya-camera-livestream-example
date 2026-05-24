@@ -941,6 +941,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       alignment: WrapAlignment.center,
       spacing: 16,
       children: [
+        /*
         Row(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -958,6 +959,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
             ),
           ],
         ),
+        */
         Row(
           mainAxisSize: MainAxisSize.min,
           children: [
