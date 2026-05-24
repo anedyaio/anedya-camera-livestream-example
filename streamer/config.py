@@ -14,6 +14,7 @@ Environment variables required (set in streamer/.env — never commit that file)
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 
@@ -21,11 +22,38 @@ from pathlib import Path
 logging.getLogger("aioice").setLevel(logging.WARNING)
 logging.getLogger("aiortc").setLevel(logging.WARNING)
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+class ConsoleColorFormatter(logging.Formatter):
+    """Add ANSI colors to local console logs without changing remote log text."""
+
+    COLORS = {
+        logging.DEBUG: "\033[36m",    # cyan
+        logging.INFO: "\033[32m",     # green
+        logging.WARNING: "\033[33m",  # yellow
+        logging.ERROR: "\033[31m",    # red
+        logging.CRITICAL: "\033[35m", # magenta
+    }
+    RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        original_levelname = record.levelname
+        color = self.COLORS.get(record.levelno)
+        try:
+            if color and sys.stderr.isatty() and "NO_COLOR" not in os.environ:
+                record.levelname = f"{color}{record.levelname}{self.RESET}"
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
+
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(
+    ConsoleColorFormatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
 )
+
+logging.basicConfig(level=logging.DEBUG, handlers=[_console_handler])
 
 log = logging.getLogger("streamer")
 
