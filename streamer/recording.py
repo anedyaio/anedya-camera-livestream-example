@@ -19,6 +19,7 @@ Segment lifecycle:
 import asyncio
 import logging
 import os
+import shutil
 import time
 from datetime import datetime
 from fractions import Fraction
@@ -42,11 +43,13 @@ class RecordingManager:
         fps: float = 30.0,
         segment_duration_seconds: int = 60,
         retention_seconds: int = 24 * 60 * 60,
+        min_free_mb: int = 512,
     ):
         self.record_path = record_path
         self.fps = fps
         self.segment_duration_seconds = segment_duration_seconds
         self.retention_seconds = retention_seconds
+        self.min_free_bytes = max(0, int(min_free_mb)) * 1024 * 1024
 
         self.frame_width: int | None = None
         self.frame_height: int | None = None
@@ -73,6 +76,7 @@ class RecordingManager:
         self._is_running = False
         self._write_failures = 0
         self._max_write_failures = 3
+        self._low_space_paused = False
         self._dropped_frames = 0
         self._last_drop_log_at = 0.0
 
@@ -260,6 +264,67 @@ class RecordingManager:
 
         self._finalized_segments = retained_segments
 
+    def _free_space_bytes(self) -> int:
+        """Return free bytes on the filesystem that stores recordings."""
+        path = self.record_path if os.path.exists(self.record_path) else "."
+        return shutil.disk_usage(path).free
+
+    def _prune_for_free_space(self) -> bool:
+        """Delete oldest finalized segments until the minimum free space is met."""
+        if self.min_free_bytes <= 0:
+            return True
+
+        os.makedirs(self.record_path, exist_ok=True)
+        free_bytes = self._free_space_bytes()
+        if free_bytes >= self.min_free_bytes:
+            if self._low_space_paused:
+                log.info(
+                    "Recording resumed: free space %.2f MB",
+                    free_bytes / (1024 * 1024),
+                )
+            self._low_space_paused = False
+            return True
+
+        deleted_count = 0
+        freed_bytes = 0
+        retained_segments: list[dict] = []
+        while self._finalized_segments and free_bytes < self.min_free_bytes:
+            segment = self._finalized_segments.pop(0)
+            path = segment["path"]
+            try:
+                size = os.path.getsize(path) if os.path.exists(path) else 0
+                if os.path.exists(path):
+                    os.remove(path)
+                deleted_count += 1
+                freed_bytes += size
+                free_bytes = self._free_space_bytes()
+            except OSError as exc:
+                log.warning("Could not delete old recording %s: %s", path, exc)
+                retained_segments.append(segment)
+
+        if retained_segments:
+            self._finalized_segments = retained_segments + self._finalized_segments
+
+        if deleted_count:
+            log.warning(
+                "Pruned %d recording segment(s) for free space, freed %.2f MB",
+                deleted_count,
+                freed_bytes / (1024 * 1024),
+            )
+
+        if free_bytes >= self.min_free_bytes:
+            self._low_space_paused = False
+            return True
+
+        if not self._low_space_paused:
+            log.error(
+                "Recording paused: low disk space %.2f MB free, need %.2f MB",
+                free_bytes / (1024 * 1024),
+                self.min_free_bytes / (1024 * 1024),
+            )
+            self._low_space_paused = True
+        return False
+
     @staticmethod
     def _read_mp4_duration(path: str) -> float | None:
         """Return MP4 duration in seconds using container/stream timestamps."""
@@ -321,15 +386,20 @@ class RecordingManager:
                 "Loaded %d existing recording segment(s)", len(self._finalized_segments)
             )
         self._prune_expired_segments()
+        self._prune_for_free_space()
 
     async def _start_new_segment(
         self, started_at: float, frame_size: tuple[int, int]
-    ) -> None:
+    ) -> bool:
         """Close the old segment (if any) and open a new av container."""
         if self._av_container:
             await self._close_current_segment(started_at)
 
         os.makedirs(self.record_path, exist_ok=True)
+        self._prune_expired_segments(started_at)
+        if not self._prune_for_free_space():
+            return False
+
         self.frame_width, self.frame_height = frame_size
 
         timestamp_str = datetime.fromtimestamp(started_at).strftime("%Y%m%d_%H%M%S")
@@ -361,6 +431,7 @@ class RecordingManager:
         self._segment_start_ts = started_at
         self._segment_path = path
         log.info("Recording segment: %s", path)
+        return True
 
     def _write_video_frame(self, bgr_frame: np.ndarray, captured_at: float) -> None:
         if not self._av_container or not self._av_video_stream or self._segment_start_ts is None:

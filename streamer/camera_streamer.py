@@ -50,6 +50,7 @@ from config import (
     MQTT_PORT,
     RECORDING_RETENTION_SECONDS,
     RECORDING_SEGMENT_SECONDS,
+    RECORDING_MIN_FREE_MB,
     TOPIC_ERRORS,
     TOPIC_HEARTBEAT,
     TOPIC_LOGS,
@@ -153,6 +154,7 @@ class CameraStreamer:
             record_path=record_path,
             segment_duration_seconds=RECORDING_SEGMENT_SECONDS,
             retention_seconds=RECORDING_RETENTION_SECONDS,
+            min_free_mb=RECORDING_MIN_FREE_MB,
         )
         self.source: CameraSource | None = None  # Camera source
         self.audio_source: MicrophoneSource | None = None  # Audio source
