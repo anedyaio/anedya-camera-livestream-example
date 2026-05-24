@@ -2,7 +2,7 @@
 Per-viewer media tracks for live streaming and DVR playback.
 
 WebcamTrack wraps CameraSource for live mode and opens recorded MP4 segment
-files directly for playback mode. Segment boundary crossing is handled
+files with PyAV for playback mode. Segment boundary crossing is handled
 transparently so the viewer sees a continuous stream.
 
 DvrAudioTrack follows the paired WebcamTrack's mode:
@@ -28,6 +28,148 @@ from config import AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE
 from recording import RecordingManager
 
 log = logging.getLogger("streamer")
+
+
+class SegmentPlaybackSession:
+    """PyAV timestamp-based reader for one recorded video segment.
+
+    The peer must follow MP4 frame timestamps, not OpenCV frame indexes. This
+    keeps seek/playback aligned with the same timing VLC uses for the file.
+    """
+
+    def __init__(self) -> None:
+        self._container: av.container.InputContainer | None = None
+        self._decoder = None
+        self._path: str | None = None
+        self._duration: float = 0.0
+        self._target_time: float = 0.0
+        self._last_media_time: float | None = None
+        self._clock_wall_start: float | None = None
+        self._clock_media_start: float | None = None
+
+    @property
+    def path(self) -> str | None:
+        return self._path
+
+    def open(self, segment: dict, in_file_offset: float = 0.0) -> bool:
+        self.close()
+        path = segment["path"]
+        try:
+            container = av.open(path, "r")
+        except Exception as exc:
+            log.warning("Cannot open video segment %s: %s", path, exc)
+            return False
+
+        video_streams = [
+            stream for stream in container.streams if stream.type == "video"
+        ]
+        if not video_streams:
+            container.close()
+            log.warning("Recording segment has no video stream: %s", path)
+            return False
+
+        video_stream = video_streams[0]
+        duration = max(0.0, float(segment.get("duration") or 0.0))
+        target_time = max(0.0, min(float(in_file_offset), duration))
+        if target_time > 0.001:
+            try:
+                seek_pts = int(target_time / float(video_stream.time_base))
+                container.seek(
+                    seek_pts,
+                    stream=video_stream,
+                    backward=True,
+                    any_frame=False,
+                )
+            except Exception as exc:
+                log.debug(
+                    "Video seek failed for %s at %.2fs: %s",
+                    path,
+                    target_time,
+                    exc,
+                )
+
+        self._container = container
+        self._decoder = container.decode(video=0)
+        self._path = path
+        self._duration = duration
+        self._target_time = target_time
+        self._last_media_time = None
+        self._clock_wall_start = None
+        self._clock_media_start = None
+        log.debug("Video playback opened: %s @ %.2fs", path, target_time)
+        return True
+
+    def close(self) -> None:
+        if self._container is not None:
+            try:
+                self._container.close()
+            except Exception:
+                pass
+        self._container = None
+        self._decoder = None
+        self._path = None
+        self._duration = 0.0
+        self._target_time = 0.0
+        self._last_media_time = None
+        self._clock_wall_start = None
+        self._clock_media_start = None
+
+    def current_media_time(self) -> float:
+        if self._last_media_time is not None:
+            return min(self._duration, self._last_media_time)
+        return self._target_time
+
+    @staticmethod
+    def _frame_time(frame: av.VideoFrame) -> float | None:
+        if frame.time is not None:
+            return float(frame.time)
+        if frame.pts is not None and frame.time_base is not None:
+            return float(frame.pts * frame.time_base)
+        return None
+
+    def _decode_next_frame(self) -> tuple[av.VideoFrame, float] | None:
+        if self._decoder is None:
+            return None
+
+        while True:
+            try:
+                frame = next(self._decoder)
+            except StopIteration:
+                return None
+            except Exception as exc:
+                log.debug("Video decode error: %s", exc)
+                return None
+
+            media_time = self._frame_time(frame)
+            if media_time is None:
+                media_time = self._last_media_time or self._target_time
+
+            # Timestamp seek can land before the target keyframe. Decode forward
+            # until the first frame that belongs to the requested position.
+            if (
+                self._last_media_time is None
+                and media_time + 0.001 < self._target_time
+            ):
+                continue
+            return frame, media_time
+
+    async def next_bgr_frame(self) -> np.ndarray | None:
+        decoded = await asyncio.to_thread(self._decode_next_frame)
+        if decoded is None:
+            return None
+
+        frame, media_time = decoded
+        if self._clock_wall_start is None or self._clock_media_start is None:
+            self._clock_wall_start = time.monotonic()
+            self._clock_media_start = media_time
+        else:
+            sleep_until = self._clock_wall_start + (media_time - self._clock_media_start)
+            sleep_for = sleep_until - time.monotonic()
+            if sleep_for > 0.001:
+                await asyncio.sleep(sleep_for)
+
+        self._last_media_time = media_time
+        return frame.to_ndarray(format="bgr24")
 
 
 class WebcamTrack(VideoStreamTrack):
@@ -58,14 +200,7 @@ class WebcamTrack(VideoStreamTrack):
         # "gap"       → black frame + silence  (recording gap in time)
         self._current_mode: str = "live"
 
-        self._playback_capture: cv2.VideoCapture | None = None
-        self._playback_file_path: str | None = None
-        self._playback_segment_duration: float = 0.0
-        self._playback_frame_count: int = 0
-        self._playback_started_at: float = 0.0
-        self._playback_start_in_file_offset: float = 0.0
-        self._playback_last_frame_index: int = -1
-        self._playback_last_frame: np.ndarray | None = None
+        self._playback = SegmentPlaybackSession()
         # Tracks the absolute offset (from recording window start) at which the
         # current segment file begins. Added to the in-file position to produce
         # the global scrubber offset reported back to the peer.
@@ -86,24 +221,17 @@ class WebcamTrack(VideoStreamTrack):
         need to reach into private state. Returns (None, 0.0) when not in
         playback mode.
         """
-        if self._current_mode != "playback" or not self._playback_file_path:
+        if self._current_mode != "playback" or not self._playback.path:
             return None, 0.0
-        elapsed = max(0.0, time.monotonic() - self._playback_started_at)
-        seek_pos = self._playback_start_in_file_offset + elapsed
-        return self._playback_file_path, seek_pos
+        return self._playback.path, self._playback.current_media_time()
 
     def current_playback_offset(self) -> float | None:
         """Seconds into the recording window while in playback mode, else None."""
         if self._current_mode == "gap":
             return self._current_gap_offset()
-        if self._current_mode != "playback" or not self._playback_capture:
+        if self._current_mode != "playback" or not self._playback.path:
             return None
-        elapsed = max(0.0, time.monotonic() - self._playback_started_at)
-        in_file_offset = min(
-            self._playback_segment_duration,
-            self._playback_start_in_file_offset + elapsed,
-        )
-        return self._playback_base_offset + in_file_offset
+        return self._playback_base_offset + self._playback.current_media_time()
 
     def _current_gap_offset(self) -> float:
         if self._current_mode != "gap":
@@ -113,28 +241,10 @@ class WebcamTrack(VideoStreamTrack):
     def _open_playback_segment(
         self, segment: dict, in_file_offset: float = 0.0
     ) -> bool:
-        if self._playback_capture:
-            self._playback_capture.release()
-
-        self._playback_capture = cv2.VideoCapture(segment["path"])
-        if not self._playback_capture.isOpened():
-            self._playback_capture = None
+        if not self._playback.open(segment, in_file_offset):
             return False
 
-        self._playback_file_path = segment["path"]
         self._playback_base_offset = segment["start_offset"]
-        self._playback_segment_duration = max(0.0, float(segment["duration"]))
-        self._playback_frame_count = max(
-            1,
-            int(self._playback_capture.get(cv2.CAP_PROP_FRAME_COUNT) or 1),
-        )
-        self._playback_started_at = time.monotonic()
-        self._playback_start_in_file_offset = max(
-            0.0,
-            min(float(in_file_offset), self._playback_segment_duration),
-        )
-        self._playback_last_frame_index = -1
-        self._playback_last_frame = None
         self._gap_next_segment = None
         self._current_mode = "playback"
         return True
@@ -155,10 +265,7 @@ class WebcamTrack(VideoStreamTrack):
             total_duration = float(timeline["duration"])
             clamped_offset = max(0.0, min(float(offset_seconds), total_duration))
 
-            if self._playback_capture:
-                self._playback_capture.release()
-                self._playback_capture = None
-            self._playback_file_path = None
+            self._playback.close()
             self._playback_base_offset = 0.0
             self._gap_base_offset = clamped_offset
             self._gap_started_at = time.monotonic()
@@ -183,16 +290,7 @@ class WebcamTrack(VideoStreamTrack):
 
     def go_live(self) -> None:
         """Switch back to live mode and release all playback resources."""
-        if self._playback_capture:
-            self._playback_capture.release()
-            self._playback_capture = None
-        self._playback_file_path = None
-        self._playback_segment_duration = 0.0
-        self._playback_frame_count = 0
-        self._playback_started_at = 0.0
-        self._playback_start_in_file_offset = 0.0
-        self._playback_last_frame_index = -1
-        self._playback_last_frame = None
+        self._playback.close()
         self._playback_base_offset = 0.0
         self._gap_base_offset = 0.0
         self._gap_started_at = 0.0
@@ -207,37 +305,16 @@ class WebcamTrack(VideoStreamTrack):
         the viewer sees a continuous stream across segment boundaries.
         Returns None only when all segments have been exhausted.
         """
-        if not self._playback_capture or not self._playback_file_path:
+        if not self._playback.path:
             return None
 
-        elapsed = max(0.0, time.monotonic() - self._playback_started_at)
-        in_file_offset = self._playback_start_in_file_offset + elapsed
-        if in_file_offset < self._playback_segment_duration:
-            target_frame_index = int(
-                (in_file_offset / self._playback_segment_duration)
-                * self._playback_frame_count
-            )
-            target_frame_index = max(
-                0,
-                min(target_frame_index, self._playback_frame_count - 1),
-            )
-
-            if (
-                target_frame_index == self._playback_last_frame_index
-                and self._playback_last_frame is not None
-            ):
-                return self._playback_last_frame.copy()
-
-            if target_frame_index != self._playback_last_frame_index + 1:
-                self._playback_capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame_index)
-            ret, frame = await asyncio.to_thread(self._playback_capture.read)
-            if ret:
-                self._playback_last_frame_index = target_frame_index
-                self._playback_last_frame = frame
-                return frame
+        frame = await self._playback.next_bgr_frame()
+        if frame is not None:
+            return frame
 
         # Current segment exhausted — try to continue with the next one.
-        next_segment = self.recorder.get_next_segment(self._playback_file_path)
+        current_path = self._playback.path
+        next_segment = self.recorder.get_next_segment(current_path)
         if not next_segment:
             return None
 
@@ -245,20 +322,12 @@ class WebcamTrack(VideoStreamTrack):
         current_segment_end = next_segment["start_offset"]
         timeline = self.recorder.get_timeline()
         for segment in timeline["segments"]:
-            if segment["path"] == self._playback_file_path:
+            if segment["path"] == current_path:
                 current_segment_end = segment["end_offset"]
                 break
 
         if next_segment["start_offset"] > current_segment_end + 0.25:
-            self._playback_capture.release()
-            self._playback_capture = None
-            self._playback_file_path = None
-            self._playback_segment_duration = 0.0
-            self._playback_frame_count = 0
-            self._playback_started_at = 0.0
-            self._playback_start_in_file_offset = 0.0
-            self._playback_last_frame_index = -1
-            self._playback_last_frame = None
+            self._playback.close()
             self._playback_base_offset = 0.0
             self._gap_base_offset = current_offset or current_segment_end
             self._gap_started_at = time.monotonic()
@@ -322,7 +391,7 @@ class WebcamTrack(VideoStreamTrack):
 
         if self._current_mode == "gap":
             frame = await self._read_next_gap_frame()
-        elif self._current_mode == "playback" and self._playback_capture:
+        elif self._current_mode == "playback" and self._playback.path:
             frame = await self._read_next_playback_frame()
             if frame is None:
                 # Reached end of all recorded segments — fall back to live.
@@ -353,9 +422,9 @@ class DvrAudioTrack(AudioStreamTrack):
     - playback → decodes recorded AAC audio from the current segment file
     - gap      → outputs silence at the correct cadence
 
-    Segment boundary crossings are detected by watching
-    video_track._playback_file_path; when it changes the audio container
-    is re-opened at the correct in-file seek position so audio stays in sync.
+    Segment boundary crossings are detected from the paired video track's
+    playback path; when it changes the audio container is re-opened at the
+    correct in-file seek position so audio stays in sync.
 
     Old recordings without an audio stream are handled gracefully by returning
     silence, so existing files never cause errors.
