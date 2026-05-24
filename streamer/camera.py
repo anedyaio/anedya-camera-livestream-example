@@ -9,10 +9,10 @@ It feeds frames to two consumers simultaneously:
 Frames are shared via an asyncio.Condition so multiple tracks can wait
 for the next frame without blocking the capture loop.
 
-Also contains:
-  configure_camera_max_resolution — probe and select the highest camera mode.
-  discover_best_camera_mode       — enumerate platform camera capabilities first.
-  draw_timestamp                  — burn a date/time stamp onto frame pixels.
+OpenCV is used only for motion detection and overlays. PyAV owns camera
+capture, while best-available mode selection is preserved.
+
+
 """
 
 import asyncio
@@ -25,6 +25,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 
+import av
 import cv2
 import numpy as np
 
@@ -204,68 +205,100 @@ def discover_best_camera_mode(
     return mode
 
 
-def configure_camera_max_resolution(
-    cap: cv2.VideoCapture,
-    target_fps: float,
-    camera_index: int | None = None,
-) -> tuple[int, int, float]:
-    """Select the highest camera mode, falling back to OpenCV probing.
+def _fallback_camera_modes(target_fps: float) -> list[CameraMode]:
+    """Highest-first fallback modes used when capability discovery is unavailable."""
+    fps = target_fps if target_fps > 0 else 30.0
+    return [
+        CameraMode(width, height, fps, "MJPG")
+        for width, height in CAPTURE_RESOLUTION_CANDIDATES
+    ]
 
-    Uses platform capability discovery when available, otherwise iterates
-    CAPTURE_RESOLUTION_CANDIDATES (highest first) and asks the
-    driver for each one. Drivers typically clamp unsupported modes to the
-    best available, so the loop stops as soon as the returned size matches
-    the requested size.
 
-    Returns:
-        (actual_width, actual_height, actual_fps)
-    """
-    mode = (
-        discover_best_camera_mode(camera_index, target_fps)
-        if camera_index is not None
-        else None
+def _camera_input_name(camera_index: int) -> tuple[str, str]:
+    system = platform.system()
+    if system == "Windows":
+        ffmpeg = _ffmpeg_exe()
+        camera_name = _windows_camera_name(ffmpeg, camera_index) if ffmpeg else None
+        if not camera_name:
+            raise RuntimeError(f"Cannot resolve DirectShow camera index {camera_index}")
+        return f"video={camera_name}", "dshow"
+    if system == "Linux":
+        return f"/dev/video{camera_index}", "v4l2"
+    raise RuntimeError(f"Unsupported camera platform for PyAV capture: {system}")
+
+
+def _pyav_options_for_mode(mode: CameraMode, input_format: str) -> dict[str, str]:
+    options = {
+        "video_size": f"{mode.width}x{mode.height}",
+        "framerate": str(mode.fps),
+    }
+    fourcc = _normalize_fourcc(mode.fourcc)
+    if input_format == "v4l2":
+        options["input_format"] = "mjpeg" if fourcc == "MJPG" else fourcc.lower()
+    elif input_format == "dshow" and fourcc == "MJPG":
+        options["vcodec"] = "mjpeg"
+    return options
+
+
+def open_best_pyav_camera(
+    camera_index: int, target_fps: float
+) -> tuple[av.container.InputContainer, CameraMode]:
+    """Open the best available camera mode with PyAV."""
+    input_name, input_format = _camera_input_name(camera_index)
+    candidates = [select_best_camera_mode(camera_index, target_fps)]
+    candidates.extend(_fallback_camera_modes(target_fps))
+
+    last_error: Exception | None = None
+    seen: set[tuple[int, int, int, str]] = set()
+    for candidate in candidates:
+        key = (
+            candidate.width,
+            candidate.height,
+            int(round(candidate.fps)),
+            _normalize_fourcc(candidate.fourcc),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            container = av.open(
+                input_name,
+                format=input_format,
+                options=_pyav_options_for_mode(candidate, input_format),
+            )
+            log.info(
+                "Camera %d opened with PyAV: %dx%d @ %.1f fps %s",
+                camera_index,
+                candidate.width,
+                candidate.height,
+                candidate.fps,
+                candidate.fourcc,
+            )
+            return container, candidate
+        except Exception as exc:
+            last_error = exc
+            log.debug(
+                "PyAV camera open failed for %dx%d @ %.1f fps %s: %s",
+                candidate.width,
+                candidate.height,
+                candidate.fps,
+                candidate.fourcc,
+                exc,
+            )
+
+    raise RuntimeError(
+        f"Cannot open camera index {camera_index} with PyAV"
+        + (f": {last_error}" if last_error else "")
     )
+
+
+def select_best_camera_mode(camera_index: int, target_fps: float) -> CameraMode:
+    """Return the best discovered mode, falling back to the candidate list."""
+    mode = discover_best_camera_mode(camera_index, target_fps)
     if mode:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, mode.width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, mode.height)
-        cap.set(cv2.CAP_PROP_FPS, mode.fps)
-        # Some backends reset pixel format when size/FPS changes. Apply FOURCC
-        # last so USB webcams stay on compressed MJPG instead of slow YUYV/YUY2.
-        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*mode.fourcc))
-        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or mode.width)
-        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or mode.height)
-        actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or mode.fps)
-        return actual_width, actual_height, actual_fps
+        return mode
+    return _fallback_camera_modes(target_fps)[0]
 
-    best_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    best_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    best_area = best_width * best_height
-
-    cap.set(cv2.CAP_PROP_FPS, target_fps)
-
-    for requested_width, requested_height in CAPTURE_RESOLUTION_CANDIDATES:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, requested_width)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_height)
-
-        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-        actual_area = actual_width * actual_height
-
-        if actual_area > best_area:
-            best_width = actual_width
-            best_height = actual_height
-            best_area = actual_area
-
-        # Driver returned at least the requested size — this is the highest
-        # supported mode. Higher candidates in the list would just be clamped
-        # back down to this, so stop here.
-        if actual_width >= requested_width and actual_height >= requested_height:
-            best_width = actual_width
-            best_height = actual_height
-            break  # driver gave us what we asked for — this is the max
-
-    actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or target_fps)
-    return best_width, best_height, actual_fps
 
 
 def draw_status_overlay(
@@ -373,31 +406,16 @@ class CameraSource:
         # Clamp to [0.0, 0.95] — 0.95 leaves at least 5% of frame for analysis.
         self._motion_roi_top_fraction = max(0.0, min(0.95, motion_roi_top_fraction))
 
-        system = platform.system()
-        if system == "Windows":
-            backend = cv2.CAP_DSHOW  # DirectShow
-        else:
-            backend = cv2.CAP_V4L2  # Video4Linux2
-
-        self.cap = cv2.VideoCapture(camera_index, backend)
-        self.cap.set(
-            cv2.CAP_PROP_FOURCC,
-            cv2.VideoWriter_fourcc(
-                *"MJPG"
-            ),  # convert the string `"MJPG"` into a 32-bit integer the driver understands
-        )
-
-        if not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open camera index {camera_index}")
-
-        self.capture_width, self.capture_height, self.capture_fps = (
-            configure_camera_max_resolution(self.cap, fps, camera_index)
-        )
+        self._av_container, selected_mode = open_best_pyav_camera(camera_index, fps)
+        self._av_decoder = self._av_container.decode(video=0)
+        self.capture_width = selected_mode.width
+        self.capture_height = selected_mode.height
+        self.capture_fps = selected_mode.fps
         if self.capture_fps > 0:
             self.fps = self.capture_fps
             self.recorder.fps = self.capture_fps
         log.info(
-            "Camera %d opened: %dx%d @ %.1f fps",
+            "Camera %d selected: %dx%d @ %.1f fps",
             camera_index,
             self.capture_width,
             self.capture_height,
@@ -510,15 +528,21 @@ class CameraSource:
             self._fps_window_started_at = now
             self._fps_window_frames = 0
 
+    def _read_pyav_frame(self) -> np.ndarray | None:
+        try:
+            frame = next(self._av_decoder)
+        except StopIteration:
+            return None
+        return frame.to_ndarray(format="bgr24")
+
     async def _capture_loop(self) -> None:
         """Main capture loop: read → analyse → annotate → record → publish."""
         frame_interval = 1 / self.fps if self.fps > 0 else 0
 
         while self._is_running:
             loop_start = time.monotonic()
-            # cap.read() blocks waiting for hardware — run in thread to keep event loop free.
-            ret, raw_frame = await asyncio.to_thread(self.cap.read)
-            if not ret:
+            raw_frame = await asyncio.to_thread(self._read_pyav_frame)
+            if raw_frame is None:
                 await asyncio.sleep(0.05)
                 continue
 
@@ -569,6 +593,5 @@ class CameraSource:
         if self._capture_task:
             await self._capture_task
             self._capture_task = None
-        if self.cap.isOpened():
-            self.cap.release()
-            log.info("Camera %d released", self.camera_index)
+        self._av_container.close()
+        log.info("Camera %d released", self.camera_index)
