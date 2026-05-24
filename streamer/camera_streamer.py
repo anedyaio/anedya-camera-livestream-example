@@ -157,9 +157,21 @@ class CameraStreamer:
         self.source: CameraSource | None = None  # Camera source
         self.audio_source: MicrophoneSource | None = None  # Audio source
 
+        self._recorder_task: asyncio.Task | None = None
         self._heartbeat_task: Future | None = None
         self._anedya_log_handler: AnedyaLogHandler | None = None
         self._mqtt_connected_event: asyncio.Event | None = None
+
+    def _on_recorder_done(self, task: asyncio.Task) -> None:
+        """Log unexpected recorder exits instead of failing silently."""
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            log.exception("Recorder task crashed")
+        else:
+            log.error("Recorder task stopped unexpectedly")
 
     async def _heartbeat_loop(self) -> None:
         """Periodically publish device heartbeat to Anedya."""
@@ -521,9 +533,8 @@ class CameraStreamer:
 
         # Recorder must be running before the camera source starts so that
         # the very first frames are not dropped while the queue is being created.
-        asyncio.create_task(
-            self.recorder.run()
-        )  # fire and forget — recorder runs forever in background
+        self._recorder_task = asyncio.create_task(self.recorder.run())
+        self._recorder_task.add_done_callback(self._on_recorder_done)
         await (
             self.recorder.wait_until_ready()
         )  # camera can't start before recorder is ready
@@ -575,6 +586,13 @@ class CameraStreamer:
             self.audio_source = None
 
         await self.recorder.stop()
+        if self._recorder_task:
+            self._recorder_task.remove_done_callback(self._on_recorder_done)
+            try:
+                await self._recorder_task
+            except asyncio.CancelledError:
+                pass
+            self._recorder_task = None
 
         if self._heartbeat_task:
             canceled = self._heartbeat_task.cancel()

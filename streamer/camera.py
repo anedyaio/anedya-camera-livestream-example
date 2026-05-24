@@ -245,8 +245,10 @@ def open_best_pyav_camera(
 ) -> tuple[av.container.InputContainer, CameraMode]:
     """Open the best available camera mode with PyAV."""
     input_name, input_format = _camera_input_name(camera_index)
-    candidates = [select_best_camera_mode(camera_index, target_fps)]
-    candidates.extend(_fallback_camera_modes(target_fps))
+    discovered_mode = discover_best_camera_mode(camera_index, target_fps)
+    candidates = ([discovered_mode] if discovered_mode else []) + _fallback_camera_modes(
+        target_fps
+    )
 
     last_error: Exception | None = None
     seen: set[tuple[int, int, int, str]] = set()
@@ -274,7 +276,14 @@ def open_best_pyav_camera(
                 candidate.fps,
                 candidate.fourcc,
             )
-            return container, candidate
+            stream = container.streams.video[0] if container.streams.video else None
+            actual_mode = CameraMode(
+                int(getattr(stream, "width", 0) or candidate.width),
+                int(getattr(stream, "height", 0) or candidate.height),
+                _stream_fps(stream) or candidate.fps,
+                candidate.fourcc,
+            )
+            return container, actual_mode
         except Exception as exc:
             last_error = exc
             log.debug(
@@ -291,13 +300,19 @@ def open_best_pyav_camera(
         + (f": {last_error}" if last_error else "")
     )
 
-
-def select_best_camera_mode(camera_index: int, target_fps: float) -> CameraMode:
-    """Return the best discovered mode, falling back to the candidate list."""
-    mode = discover_best_camera_mode(camera_index, target_fps)
-    if mode:
-        return mode
-    return _fallback_camera_modes(target_fps)[0]
+def _stream_fps(stream) -> float | None:
+    if stream is None:
+        return None
+    for attr in ("average_rate", "base_rate", "guessed_rate"):
+        rate = getattr(stream, attr, None)
+        if rate:
+            try:
+                value = float(rate)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if value > 0:
+                return value
+    return None
 
 
 
@@ -442,6 +457,7 @@ class CameraSource:
         self._latest_frame: np.ndarray | None = None
         self._latest_timestamp: float = 0.0
         self._measured_fps: float | None = None
+        self._actual_frame_shape_logged = False
         self._fps_window_started_at = time.monotonic()
         self._fps_window_frames = 0
 
@@ -533,7 +549,21 @@ class CameraSource:
             frame = next(self._av_decoder)
         except StopIteration:
             return None
-        return frame.to_ndarray(format="bgr24")
+        raw_frame = frame.to_ndarray(format="bgr24")
+        if not self._actual_frame_shape_logged:
+            height, width = raw_frame.shape[:2]
+            if (width, height) != (self.capture_width, self.capture_height):
+                log.info(
+                    "Camera actual decoded size: %dx%d (requested %dx%d)",
+                    width,
+                    height,
+                    self.capture_width,
+                    self.capture_height,
+                )
+                self.capture_width = width
+                self.capture_height = height
+            self._actual_frame_shape_logged = True
+        return raw_frame
 
     async def _capture_loop(self) -> None:
         """Main capture loop: read → analyse → annotate → record → publish."""

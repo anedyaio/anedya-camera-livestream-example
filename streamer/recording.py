@@ -71,6 +71,8 @@ class RecordingManager:
             None  # audio frames waiting to be written
         )
         self._is_running = False
+        self._write_failures = 0
+        self._max_write_failures = 3
         self._dropped_frames = 0
         self._last_drop_log_at = 0.0
 
@@ -120,7 +122,7 @@ class RecordingManager:
             pass
 
     @staticmethod
-    def _flush_container(container, video_stream, audio_stream) -> None:
+    def _flush_container(container, video_stream, audio_stream) -> bool:
         """Flush encoder buffers and close the av container. Runs in a thread."""
         try:
             if video_stream:
@@ -130,8 +132,18 @@ class RecordingManager:
                 for pkt in audio_stream.encode(None):
                     container.mux(pkt)
             container.close()
+            return True
         except Exception as exc:
             log.warning("Error flushing recording segment: %s", exc)
+            return False
+
+    @staticmethod
+    def _close_container_without_flush(container) -> None:
+        """Close a failed container without asking encoders for more packets."""
+        try:
+            container.close()
+        except Exception as exc:
+            log.debug("Error closing failed recording segment: %s", exc)
 
     async def _close_current_segment(self, closed_at: float) -> None:
         """Flush the av container off the event loop and register the segment metadata."""
@@ -159,11 +171,20 @@ class RecordingManager:
         self._segment_path     = None
 
         # Blocking flush happens in a thread — event loop stays free.
-        await asyncio.to_thread(self._flush_container, container, video_stream, audio_stream)
-
-        duration = max(0.0, closed_at - segment_start)
-        if duration <= 0:
+        flushed = await asyncio.to_thread(
+            self._flush_container, container, video_stream, audio_stream
+        )
+        if not flushed:
+            log.warning("Skipping unfinalized recording segment after flush failure: %s", path)
+            self._delete_file(path, "failed recording segment")
             return
+
+        duration = self._read_mp4_duration(path)
+        if duration is None or duration <= 0:
+            log.warning("Skipping recording segment with unreadable duration: %s", path)
+            self._delete_file(path, "unreadable recording segment")
+            return
+        segment_end = segment_start + duration
 
         self._finalized_segments.append(
             {
@@ -171,12 +192,41 @@ class RecordingManager:
                 "path":     path,
                 "size":     os.path.getsize(path) if os.path.exists(path) else 0,
                 "start_ts": segment_start,
-                "end_ts":   closed_at,
+                "end_ts":   segment_end,
                 "duration": duration,
             }
         )
         self._finalized_segments.sort(key=lambda seg: seg["start_ts"])
         self._prune_expired_segments(closed_at)
+
+    async def _abort_current_segment(self) -> None:
+        """Drop the current partially-written segment after an encoder/muxer error."""
+        if not self._av_container:
+            return
+
+        container = self._av_container
+        path = self._segment_path
+
+        self._av_container = None
+        self._av_video_stream = None
+        self._av_audio_stream = None
+        self._video_pts = 0
+        self._audio_pts = 0
+        self._segment_start_ts = None
+        self._segment_path = None
+
+        await asyncio.to_thread(self._close_container_without_flush, container)
+        self._delete_file(path, "failed recording segment")
+
+    @staticmethod
+    def _delete_file(path: str | None, reason: str) -> None:
+        if not path or not os.path.exists(path):
+            return
+        try:
+            os.remove(path)
+            log.warning("Discarded %s: %s", reason, path)
+        except OSError as exc:
+            log.warning("Could not delete %s %s: %s", reason, path, exc)
 
     def _prune_expired_segments(self, now: float | None = None) -> None:
         """Delete finalized recordings fully outside the retention window."""
@@ -344,6 +394,7 @@ class RecordingManager:
         )
         aframe.pts = self._audio_pts
         aframe.sample_rate = AUDIO_SAMPLE_RATE
+        aframe.time_base = Fraction(1, AUDIO_SAMPLE_RATE)
         self._audio_pts += samples
         for pkt in self._av_audio_stream.encode(aframe):
             self._av_container.mux(pkt)
@@ -508,12 +559,19 @@ class RecordingManager:
                         await asyncio.to_thread(
                             self._write_frame_and_audio, frame, captured_at, audio_frames
                         )
+                        self._write_failures = 0
                     except Exception as exc:
-                        log.error(
-                            "Failed to write recording frame: %s — stopping recorder",
+                        self._write_failures += 1
+                        log.exception(
+                            "Failed to write recording frame (%d/%d): %s",
+                            self._write_failures,
+                            self._max_write_failures,
                             exc,
                         )
-                        self._is_running = False
+                        await self._abort_current_segment()
+                        if self._write_failures >= self._max_write_failures:
+                            log.error("Stopping recorder after repeated write failures")
+                            self._is_running = False
 
             except asyncio.TimeoutError:
                 # No video frame arrived — still flush any queued audio so
