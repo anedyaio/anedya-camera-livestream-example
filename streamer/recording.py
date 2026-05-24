@@ -21,14 +21,16 @@ import logging
 import os
 import time
 from datetime import datetime
+from fractions import Fraction
 
 import av
-import cv2
 import numpy as np
 
 from config import AUDIO_CHANNELS, AUDIO_SAMPLE_RATE
 
 log = logging.getLogger("streamer")
+
+VIDEO_TIME_BASE = Fraction(1, 90_000)
 
 
 class RecordingManager:
@@ -54,9 +56,8 @@ class RecordingManager:
         self._av_video_stream = None  # video track inside current open MP4 file
         self._av_audio_stream = None  # audio track inside current open MP4 file
 
-        # PTS = Presentation Time Stamp
-        # The number of video/audio frames written so far, used to set the timestamp
-        # on each frame packet before writing to the container.
+        # PTS = Presentation Time Stamp. Video uses a high-resolution time base
+        # so recordings preserve real capture timing instead of FPS guesses.
         self._video_pts: int = 0
         self._audio_pts: int = 0
 
@@ -211,16 +212,19 @@ class RecordingManager:
 
     @staticmethod
     def _read_mp4_duration(path: str) -> float | None:
-        """Return MP4 duration in seconds, or None for unreadable files."""
-        capture = cv2.VideoCapture(path)
+        """Return MP4 duration in seconds using container/stream timestamps."""
         try:
-            if capture.isOpened():
-                fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
-                frame_count = float(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
-                if fps > 0 and frame_count > 0:
-                    return frame_count / fps
-        finally:
-            capture.release()
+            with av.open(path, "r") as container:
+                if container.duration:
+                    return float(container.duration) / av.time_base
+
+                durations: list[float] = []
+                for stream in container.streams:
+                    if stream.duration is not None and stream.time_base is not None:
+                        durations.append(float(stream.duration * stream.time_base))
+                return max(durations) if durations else None
+        except Exception as exc:
+            log.warning("Could not read MP4 duration with PyAV (%s): %s", path, exc)
         return None
 
     def _load_existing_segments(self) -> None:
@@ -293,6 +297,7 @@ class RecordingManager:
         vstream.width = frame_size[0]
         vstream.height = frame_size[1]
         vstream.pix_fmt = "yuvj420p"
+        vstream.time_base = VIDEO_TIME_BASE
 
         astream = container.add_stream("aac", rate=AUDIO_SAMPLE_RATE)  # audio track
         astream.layout = "mono" if AUDIO_CHANNELS == 1 else "stereo"
@@ -311,14 +316,15 @@ class RecordingManager:
             return
         vframe = av.VideoFrame.from_ndarray(bgr_frame, format="bgr24")
         vframe = vframe.reformat(format="yuvj420p")
-        # Compute PTS from wall-clock elapsed time so playback speed matches reality
-        # even when the camera drops frames or delivers them late.
+        # Store capture time at 90 kHz precision so playback follows actual
+        # frame timing even when capture is irregular.
         elapsed = max(0.0, captured_at - self._segment_start_ts)
-        pts = int(elapsed * self.fps)
+        pts = round(elapsed / float(VIDEO_TIME_BASE))
         if pts <= self._video_pts:
             pts = self._video_pts + 1
         self._video_pts = pts
         vframe.pts = pts
+        vframe.time_base = VIDEO_TIME_BASE
         for pkt in self._av_video_stream.encode(vframe):
             self._av_container.mux(pkt)
 
