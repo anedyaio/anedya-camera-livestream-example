@@ -91,7 +91,7 @@ class RecordingManager:
         Non-blocking — frames are dropped if the queue is full rather than
         stalling the live capture pipeline.
         """
-        if self._frame_queue is None:
+        if not self._is_running or self._frame_queue is None:
             return
         try:
             self._frame_queue.put_nowait((frame, captured_at))
@@ -112,7 +112,7 @@ class RecordingManager:
         are acceptable; they create a brief silence in the file rather than
         stalling capture.
         """
-        if self._audio_queue is None:
+        if not self._is_running or self._audio_queue is None:
             return
         try:
             self._audio_queue.put_nowait(pcm.copy())
@@ -298,6 +298,7 @@ class RecordingManager:
         vstream.height = frame_size[1]
         vstream.pix_fmt = "yuvj420p"
         vstream.time_base = VIDEO_TIME_BASE
+        vstream.codec_context.time_base = VIDEO_TIME_BASE
 
         astream = container.add_stream("aac", rate=AUDIO_SAMPLE_RATE)  # audio track
         astream.layout = "mono" if AUDIO_CHANNELS == 1 else "stereo"

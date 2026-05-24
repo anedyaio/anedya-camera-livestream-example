@@ -425,6 +425,8 @@ class DvrAudioTrack(AudioStreamTrack):
     Segment boundary crossings are detected from the paired video track's
     playback path; when it changes the audio container is re-opened at the
     correct in-file seek position so audio stays in sync.
+    Video and audio still use separate PyAV containers, but both seek by stream
+    timestamps and the video track supplies the current playback position.
 
     Old recordings without an audio stream are handled gracefully by returning
     silence, so existing files never cause errors.
@@ -449,6 +451,8 @@ class DvrAudioTrack(AudioStreamTrack):
         self._pb_decoder = None  # iterator from container.decode(audio=0)
         self._pb_fifo: collections.deque = collections.deque()
         self._pb_path: str | None = None  # path of currently open container
+        self._pb_seek_seconds: float = 0.0
+        self._pb_discard_until_seek: bool = False
 
     def _open_audio_segment(self, path: str, seek_seconds: float) -> None:
         """Open an av input container for audio playback. Called in a thread."""
@@ -467,11 +471,17 @@ class DvrAudioTrack(AudioStreamTrack):
             self._pb_path = path
             return
 
+        audio_stream = audio_streams[0]
+        seek_seconds = max(0.0, float(seek_seconds))
         if seek_seconds > 0.05:
             try:
-                # av.open uses AV_TIME_BASE (microseconds) for the default seek.
-                seek_us = int(seek_seconds * 1_000_000)
-                container.seek(seek_us)
+                seek_pts = int(seek_seconds / float(audio_stream.time_base))
+                container.seek(
+                    seek_pts,
+                    stream=audio_stream,
+                    backward=True,
+                    any_frame=False,
+                )
             except Exception as exc:
                 log.debug(
                     "Audio seek failed for %s at %.2fs: %s", path, seek_seconds, exc
@@ -490,6 +500,8 @@ class DvrAudioTrack(AudioStreamTrack):
         self._pb_decoder = container.decode(audio=0)
         self._pb_fifo.clear()
         self._pb_path = path
+        self._pb_seek_seconds = seek_seconds
+        self._pb_discard_until_seek = seek_seconds > 0.05
         log.debug("Audio playback opened: %s @ %.2fs", path, seek_seconds)
 
     def _close_audio_segment(self) -> None:
@@ -503,6 +515,8 @@ class DvrAudioTrack(AudioStreamTrack):
         self._pb_decoder = None
         self._pb_fifo.clear()
         self._pb_path = None
+        self._pb_seek_seconds = 0.0
+        self._pb_discard_until_seek = False
 
     def _make_frame(self, pcm_t: np.ndarray) -> av.AudioFrame:
         """Wrap a (channels, samples) int16 array into a timestamped AudioFrame."""
@@ -535,6 +549,16 @@ class DvrAudioTrack(AudioStreamTrack):
             if raw is None:
                 return False
             for rf in self._pb_resampler.resample(raw):
+                frame_time = (
+                    float(rf.pts * rf.time_base) if rf.pts is not None else None
+                )
+                if (
+                    self._pb_discard_until_seek
+                    and frame_time is not None
+                    and frame_time + rf.samples / rf.sample_rate < self._pb_seek_seconds
+                ):
+                    continue
+                self._pb_discard_until_seek = False
                 self._pb_fifo.append(rf.to_ndarray())
             return True
         except Exception as exc:
@@ -558,7 +582,8 @@ class DvrAudioTrack(AudioStreamTrack):
         if self._pb_container is None:
             return self._silence_frame()
 
-        # Fill fifo if needed, then pop one frame.
+        # Fill fifo if needed, then pop one frame. Seek can land before target,
+        # so decoding drops early frames until the requested audio timestamp.
         while not self._pb_fifo:
             produced = await asyncio.to_thread(self._decode_next_into_fifo)
             if not produced:
