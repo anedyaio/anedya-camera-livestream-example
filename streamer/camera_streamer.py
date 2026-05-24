@@ -412,6 +412,7 @@ class CameraStreamer:
             log.info(
                 "DataChannel opened (session=%s, label=%s)", session_id, channel.label
             )
+            command_lock = asyncio.Lock()
 
             def push_timeline_to_peer() -> None:
                 timeline = self.recorder.get_timeline()
@@ -433,30 +434,37 @@ class CameraStreamer:
 
             @channel.on("message")
             def on_channel_message(raw_message):
-                try:
-                    command = json.loads(raw_message)
-                except json.JSONDecodeError:
-                    return
+                asyncio.create_task(handle_channel_message(raw_message))
 
-                action = command.get("cmd")
-                if action in ("list", "timeline"):
-                    push_timeline_to_peer()
-                elif action == "seek":
-                    offset = float(command.get("offset", 0))
-                    if video_track.seek(offset):
-                        push_timeline_to_peer()
-                    else:
-                        channel.send(
-                            json.dumps(
-                                {
-                                    "type": "error",
-                                    "message": "No recording available at selected time",
-                                }
-                            )
-                        )
-                elif action == "live":
-                    video_track.go_live()
-                    push_timeline_to_peer()
+            async def handle_channel_message(raw_message):
+                async with command_lock:
+                    try:
+                        command = json.loads(raw_message)
+                    except json.JSONDecodeError:
+                        return
+
+                    try:
+                        action = command.get("cmd")
+                        if action in ("list", "timeline"):
+                            push_timeline_to_peer()
+                        elif action == "seek":
+                            offset = float(command.get("offset", 0))
+                            if await video_track.seek(offset):
+                                push_timeline_to_peer()
+                            else:
+                                channel.send(
+                                    json.dumps(
+                                        {
+                                            "type": "error",
+                                            "message": "No recording available at selected time",
+                                        }
+                                    )
+                                )
+                        elif action == "live":
+                            await video_track.go_live()
+                            push_timeline_to_peer()
+                    except Exception:
+                        log.exception("DataChannel command failed")
 
             # Send the current timeline immediately so the peer UI can render
             # the scrubber without waiting for the first user interaction.

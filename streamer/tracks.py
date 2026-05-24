@@ -30,41 +30,63 @@ from recording import RecordingManager
 log = logging.getLogger("streamer")
 
 
-class SegmentPlaybackSession:
-    """PyAV timestamp-based reader for one recorded video segment.
+class PeerPlaybackSession:
+    """Per-peer PyAV playback state for recorded video and audio.
 
-    The peer must follow MP4 frame timestamps, not OpenCV frame indexes. This
-    keeps seek/playback aligned with the same timing VLC uses for the file.
+    One object owns the active segment, seek position, video decoder, audio
+    decoder, and segment transitions for a viewer. Video and audio use separate
+    PyAV containers because aiortc calls their recv() methods independently.
     """
 
-    def __init__(self) -> None:
-        self._container: av.container.InputContainer | None = None
-        self._decoder = None
+    def __init__(self, recorder: RecordingManager) -> None:
+        self._recorder = recorder
+        self._lock = asyncio.Lock()
+
+        self._video_container: av.container.InputContainer | None = None
+        self._video_decoder = None
+        self._audio_container: av.container.InputContainer | None = None
+        self._audio_decoder = None
+        self._audio_resampler: av.audio.resampler.AudioResampler | None = None
+        self._audio_fifo: collections.deque = collections.deque()
+
+        self._segment: dict | None = None
         self._path: str | None = None
         self._duration: float = 0.0
         self._target_time: float = 0.0
+        self._base_offset: float = 0.0
         self._last_media_time: float | None = None
         self._clock_wall_start: float | None = None
         self._clock_media_start: float | None = None
+        self._audio_seek_seconds: float = 0.0
+        self._audio_discard_until_seek: bool = False
+        self._audio_available: bool = False
 
     @property
     def path(self) -> str | None:
         return self._path
 
-    def open(self, segment: dict, in_file_offset: float = 0.0) -> bool:
-        self.close()
+    @property
+    def base_offset(self) -> float:
+        return self._base_offset
+
+    async def open(self, segment: dict, in_file_offset: float = 0.0) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._open_sync, segment, in_file_offset)
+
+    def _open_sync(self, segment: dict, in_file_offset: float = 0.0) -> bool:
+        self._close_sync()
         path = segment["path"]
         try:
-            container = av.open(path, "r")
+            video_container = av.open(path, "r")
         except Exception as exc:
             log.warning("Cannot open video segment %s: %s", path, exc)
             return False
 
         video_streams = [
-            stream for stream in container.streams if stream.type == "video"
+            stream for stream in video_container.streams if stream.type == "video"
         ]
         if not video_streams:
-            container.close()
+            video_container.close()
             log.warning("Recording segment has no video stream: %s", path)
             return False
 
@@ -74,7 +96,7 @@ class SegmentPlaybackSession:
         if target_time > 0.001:
             try:
                 seek_pts = int(target_time / float(video_stream.time_base))
-                container.seek(
+                video_container.seek(
                     seek_pts,
                     stream=video_stream,
                     backward=True,
@@ -88,36 +110,112 @@ class SegmentPlaybackSession:
                     exc,
                 )
 
-        self._container = container
-        self._decoder = container.decode(video=0)
+        self._video_container = video_container
+        self._video_decoder = video_container.decode(video=0)
+        self._open_audio_sync(path, target_time)
+        self._segment = segment
         self._path = path
         self._duration = duration
         self._target_time = target_time
+        self._base_offset = float(segment.get("start_offset") or 0.0)
         self._last_media_time = None
         self._clock_wall_start = None
         self._clock_media_start = None
         log.debug("Video playback opened: %s @ %.2fs", path, target_time)
         return True
 
-    def close(self) -> None:
-        if self._container is not None:
+    def _open_audio_sync(self, path: str, seek_seconds: float) -> None:
+        try:
+            audio_container = av.open(path, "r")
+        except Exception as exc:
+            log.warning("Cannot open audio segment %s: %s", path, exc)
+            return
+
+        audio_streams = [
+            stream for stream in audio_container.streams if stream.type == "audio"
+        ]
+        if not audio_streams:
+            audio_container.close()
+            log.debug("Recording segment has no audio stream: %s", path)
+            return
+
+        audio_stream = audio_streams[0]
+        seek_seconds = max(0.0, float(seek_seconds))
+        if seek_seconds > 0.05:
             try:
-                self._container.close()
+                seek_pts = int(seek_seconds / float(audio_stream.time_base))
+                audio_container.seek(
+                    seek_pts,
+                    stream=audio_stream,
+                    backward=True,
+                    any_frame=False,
+                )
+            except Exception as exc:
+                log.debug(
+                    "Audio seek failed for %s at %.2fs: %s", path, seek_seconds, exc
+                )
+
+        layout = "mono" if AUDIO_CHANNELS == 1 else "stereo"
+        self._audio_container = audio_container
+        self._audio_decoder = audio_container.decode(audio=0)
+        self._audio_resampler = av.audio.resampler.AudioResampler(
+            format="s16p",
+            layout=layout,
+            rate=AUDIO_SAMPLE_RATE,
+            frame_size=AUDIO_FRAME_SAMPLES,
+        )
+        self._audio_fifo.clear()
+        self._audio_seek_seconds = seek_seconds
+        self._audio_discard_until_seek = seek_seconds > 0.05
+        self._audio_available = True
+        log.debug("Audio playback opened: %s @ %.2fs", path, seek_seconds)
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._close_sync()
+
+    def close_now(self) -> None:
+        """Synchronous close for aiortc stop()/peer teardown paths."""
+        self._close_sync()
+
+    def _close_sync(self) -> None:
+        if self._video_container is not None:
+            try:
+                self._video_container.close()
             except Exception:
                 pass
-        self._container = None
-        self._decoder = None
+        if self._audio_container is not None:
+            try:
+                self._audio_container.close()
+            except Exception:
+                pass
+        self._video_container = None
+        self._video_decoder = None
+        self._audio_container = None
+        self._audio_decoder = None
+        self._audio_resampler = None
+        self._audio_fifo.clear()
+        self._segment = None
         self._path = None
         self._duration = 0.0
         self._target_time = 0.0
+        self._base_offset = 0.0
         self._last_media_time = None
         self._clock_wall_start = None
         self._clock_media_start = None
+        self._audio_seek_seconds = 0.0
+        self._audio_discard_until_seek = False
+        self._audio_available = False
 
     def current_media_time(self) -> float:
         if self._last_media_time is not None:
             return min(self._duration, self._last_media_time)
         return self._target_time
+
+    def current_playback_offset(self) -> float | None:
+        if not self._path:
+            return None
+        return self._base_offset + self.current_media_time()
 
     @staticmethod
     def _frame_time(frame: av.VideoFrame) -> float | None:
@@ -128,12 +226,12 @@ class SegmentPlaybackSession:
         return None
 
     def _decode_next_frame(self) -> tuple[av.VideoFrame, float] | None:
-        if self._decoder is None:
+        if self._video_decoder is None:
             return None
 
         while True:
             try:
-                frame = next(self._decoder)
+                frame = next(self._video_decoder)
             except StopIteration:
                 return None
             except Exception as exc:
@@ -153,23 +251,95 @@ class SegmentPlaybackSession:
                 continue
             return frame, media_time
 
-    async def next_bgr_frame(self) -> np.ndarray | None:
-        decoded = await asyncio.to_thread(self._decode_next_frame)
-        if decoded is None:
-            return None
+    async def next_video_frame(
+        self,
+    ) -> tuple[str, np.ndarray | None, float | None, dict | None]:
+        """Return the next video frame, or signal gap/eof after segment end."""
+        while True:
+            async with self._lock:
+                decoded = await asyncio.to_thread(self._decode_next_frame)
+                if decoded is None:
+                    result = await asyncio.to_thread(self._advance_after_video_eof_sync)
+                    if result[0] == "retry":
+                        continue
+                    return result
 
-        frame, media_time = decoded
-        if self._clock_wall_start is None or self._clock_media_start is None:
-            self._clock_wall_start = time.monotonic()
-            self._clock_media_start = media_time
-        else:
-            sleep_until = self._clock_wall_start + (media_time - self._clock_media_start)
-            sleep_for = sleep_until - time.monotonic()
+                frame, media_time = decoded
+                sleep_for = 0.0
+                if self._clock_wall_start is None or self._clock_media_start is None:
+                    self._clock_wall_start = time.monotonic()
+                    self._clock_media_start = media_time
+                else:
+                    sleep_until = self._clock_wall_start + (
+                        media_time - self._clock_media_start
+                    )
+                    sleep_for = sleep_until - time.monotonic()
+
+                self._last_media_time = media_time
+
             if sleep_for > 0.001:
                 await asyncio.sleep(sleep_for)
+            return "frame", frame.to_ndarray(format="bgr24"), None, None
 
-        self._last_media_time = media_time
-        return frame.to_ndarray(format="bgr24")
+    def _advance_after_video_eof_sync(
+        self,
+    ) -> tuple[str, np.ndarray | None, float | None, dict | None]:
+        current_path = self._path
+        current_segment = self._segment
+        if not current_path or not current_segment:
+            return "eof", None, None, None
+
+        next_segment = self._recorder.get_next_segment(current_path)
+        if not next_segment:
+            return "eof", None, None, None
+
+        current_offset = self.current_playback_offset()
+        current_segment_end = float(current_segment.get("end_offset") or 0.0)
+        next_start = float(next_segment.get("start_offset") or 0.0)
+        if next_start > current_segment_end + 0.25:
+            gap_offset = current_offset if current_offset is not None else current_segment_end
+            self._close_sync()
+            return "gap", None, gap_offset, next_segment
+
+        if not self._open_sync(next_segment, 0.0):
+            return "eof", None, None, None
+
+        return "retry", None, None, None
+
+    def _decode_next_audio_pcm(self) -> np.ndarray | None:
+        if not self._audio_available or self._audio_decoder is None:
+            return None
+        if self._audio_resampler is None:
+            return None
+
+        while not self._audio_fifo:
+            try:
+                raw = next(self._audio_decoder, None)
+            except Exception as exc:
+                log.debug("Audio decode error: %s", exc)
+                return None
+            if raw is None:
+                return None
+
+            for rf in self._audio_resampler.resample(raw):
+                frame_time = (
+                    float(rf.pts * rf.time_base) if rf.pts is not None else None
+                )
+                if (
+                    self._audio_discard_until_seek
+                    and frame_time is not None
+                    and frame_time + rf.samples / rf.sample_rate < self._audio_seek_seconds
+                ):
+                    continue
+                self._audio_discard_until_seek = False
+                self._audio_fifo.append(rf.to_ndarray())
+
+        return self._audio_fifo.popleft()
+
+    async def next_audio_pcm(self) -> np.ndarray | None:
+        """Return one resampled playback audio frame, or None for silence."""
+        async with self._lock:
+            return await asyncio.to_thread(self._decode_next_audio_pcm)
 
 
 class WebcamTrack(VideoStreamTrack):
@@ -200,11 +370,7 @@ class WebcamTrack(VideoStreamTrack):
         # "gap"       → black frame + silence  (recording gap in time)
         self._current_mode: str = "live"
 
-        self._playback = SegmentPlaybackSession()
-        # Tracks the absolute offset (from recording window start) at which the
-        # current segment file begins. Added to the in-file position to produce
-        # the global scrubber offset reported back to the peer.
-        self._playback_base_offset: float = 0.0
+        self._playback = PeerPlaybackSession(recorder)
         self._gap_base_offset: float = 0.0
         self._gap_started_at: float = 0.0
         self._gap_next_segment: dict | None = None
@@ -214,42 +380,35 @@ class WebcamTrack(VideoStreamTrack):
         """Current viewer mode: ``"live"``, ``"playback"``, or ``"gap"``."""
         return self._current_mode
 
-    def playback_audio_position(self) -> tuple[str | None, float]:
-        """Return (file_path, seek_seconds) for DvrAudioTrack to sync to.
-
-        Encapsulates the seek-position calculation so DvrAudioTrack doesn't
-        need to reach into private state. Returns (None, 0.0) when not in
-        playback mode.
-        """
-        if self._current_mode != "playback" or not self._playback.path:
-            return None, 0.0
-        return self._playback.path, self._playback.current_media_time()
+    @property
+    def playback_session(self) -> PeerPlaybackSession:
+        """Shared recorded playback session used by paired audio/video tracks."""
+        return self._playback
 
     def current_playback_offset(self) -> float | None:
         """Seconds into the recording window while in playback mode, else None."""
         if self._current_mode == "gap":
             return self._current_gap_offset()
-        if self._current_mode != "playback" or not self._playback.path:
+        if self._current_mode != "playback":
             return None
-        return self._playback_base_offset + self._playback.current_media_time()
+        return self._playback.current_playback_offset()
 
     def _current_gap_offset(self) -> float:
         if self._current_mode != "gap":
             return 0.0
         return self._gap_base_offset + max(0.0, time.monotonic() - self._gap_started_at)
 
-    def _open_playback_segment(
+    async def _open_playback_segment(
         self, segment: dict, in_file_offset: float = 0.0
     ) -> bool:
-        if not self._playback.open(segment, in_file_offset):
+        if not await self._playback.open(segment, in_file_offset):
             return False
 
-        self._playback_base_offset = segment["start_offset"]
         self._gap_next_segment = None
         self._current_mode = "playback"
         return True
 
-    def seek(self, offset_seconds: float) -> bool:
+    async def seek(self, offset_seconds: float) -> bool:
         """Seek this viewer to a position in the recording window.
 
         Opens the appropriate segment file and positions the reader at the
@@ -265,8 +424,7 @@ class WebcamTrack(VideoStreamTrack):
             total_duration = float(timeline["duration"])
             clamped_offset = max(0.0, min(float(offset_seconds), total_duration))
 
-            self._playback.close()
-            self._playback_base_offset = 0.0
+            await self._playback.close()
             self._gap_base_offset = clamped_offset
             self._gap_started_at = time.monotonic()
             self._gap_next_segment = self.recorder.get_next_segment_after_offset(
@@ -276,22 +434,18 @@ class WebcamTrack(VideoStreamTrack):
             log.info("Seek to recording gap @ %.1fs", clamped_offset)
             return True
 
-        segment, in_file_offset, global_offset = resolved
+        segment, in_file_offset, _global_offset = resolved
 
-        if not self._open_playback_segment(segment, in_file_offset):
+        if not await self._open_playback_segment(segment, in_file_offset):
             return False
 
-        # global_offset - in_file_offset gives the absolute position of this
-        # segment's start in the full recording window.
-        self._playback_base_offset = global_offset - in_file_offset
         self._gap_next_segment = None
         log.info("Seek to playback: %s @ %.1fs", segment["path"], in_file_offset)
         return True
 
-    def go_live(self) -> None:
+    async def go_live(self) -> None:
         """Switch back to live mode and release all playback resources."""
-        self._playback.close()
-        self._playback_base_offset = 0.0
+        await self._playback.close()
         self._gap_base_offset = 0.0
         self._gap_started_at = 0.0
         self._gap_next_segment = None
@@ -299,47 +453,21 @@ class WebcamTrack(VideoStreamTrack):
         log.info("Switched to live mode")
 
     async def _read_next_playback_frame(self) -> np.ndarray | None:
-        """Read the next frame from the active playback file.
-
-        When the current file ends, automatically opens the next segment so
-        the viewer sees a continuous stream across segment boundaries.
-        Returns None only when all segments have been exhausted.
-        """
-        if not self._playback.path:
-            return None
-
-        frame = await self._playback.next_bgr_frame()
-        if frame is not None:
+        """Read the next frame from the active playback session."""
+        status, frame, gap_offset, next_segment = await self._playback.next_video_frame()
+        if status == "frame" and frame is not None:
             return frame
 
-        # Current segment exhausted — try to continue with the next one.
-        current_path = self._playback.path
-        next_segment = self.recorder.get_next_segment(current_path)
-        if not next_segment:
-            return None
-
-        current_offset = self.current_playback_offset()
-        current_segment_end = next_segment["start_offset"]
-        timeline = self.recorder.get_timeline()
-        for segment in timeline["segments"]:
-            if segment["path"] == current_path:
-                current_segment_end = segment["end_offset"]
-                break
-
-        if next_segment["start_offset"] > current_segment_end + 0.25:
-            self._playback.close()
-            self._playback_base_offset = 0.0
-            self._gap_base_offset = current_offset or current_segment_end
+        if status == "gap":
+            await self._playback.close()
+            self._gap_base_offset = gap_offset or 0.0
             self._gap_started_at = time.monotonic()
             self._gap_next_segment = next_segment
             self._current_mode = "gap"
             log.info("Playback entered recording gap @ %.1fs", self._gap_base_offset)
             return self._gap_frame()
 
-        if not self._open_playback_segment(next_segment, 0.0):
-            return None
-
-        return await self._read_next_playback_frame()
+        return None
 
     def _gap_frame(self) -> np.ndarray:
         frame = np.zeros(
@@ -369,7 +497,7 @@ class WebcamTrack(VideoStreamTrack):
         current_offset = self._current_gap_offset()
         next_segment = self._gap_next_segment
         if next_segment and current_offset >= next_segment["start_offset"]:
-            if self._open_playback_segment(next_segment, 0.0):
+            if await self._open_playback_segment(next_segment, 0.0):
                 frame = await self._read_next_playback_frame()
                 if frame is not None:
                     return frame
@@ -395,7 +523,7 @@ class WebcamTrack(VideoStreamTrack):
             frame = await self._read_next_playback_frame()
             if frame is None:
                 # Reached end of all recorded segments — fall back to live.
-                self.go_live()
+                await self.go_live()
                 self._last_frame_sequence, frame, _ = await self.source.get_next_frame(
                     self._last_frame_sequence
                 )
@@ -412,24 +540,18 @@ class WebcamTrack(VideoStreamTrack):
 
     def stop(self) -> None:
         """Release playback resources when the peer disconnects."""
-        self.go_live()
+        self._playback.close_now()
+        self._current_mode = "live"
+        super().stop()
 
 
 class DvrAudioTrack(AudioStreamTrack):
-    """Per-peer audio track that follows the paired WebcamTrack's playback mode.
+    """Per-peer audio track that follows the paired WebcamTrack mode.
 
-    - live     → streams live mic audio from MicrophoneSource queue
-    - playback → decodes recorded AAC audio from the current segment file
-    - gap      → outputs silence at the correct cadence
-
-    Segment boundary crossings are detected from the paired video track's
-    playback path; when it changes the audio container is re-opened at the
-    correct in-file seek position so audio stays in sync.
-    Video and audio still use separate PyAV containers, but both seek by stream
-    timestamps and the video track supplies the current playback position.
-
-    Old recordings without an audio stream are handled gracefully by returning
-    silence, so existing files never cause errors.
+    Live mode reads from the shared microphone queue. Playback mode delegates to
+    the same PeerPlaybackSession used by video, so segment path, seek position,
+    and segment crossing are owned in one place. Segments without audio return
+    silence instead of failing.
     """
 
     kind = "audio"
@@ -441,82 +563,8 @@ class DvrAudioTrack(AudioStreamTrack):
         self._subscriber_id, self._mic_queue = source.subscribe()
         self._pts = 0
 
-        # Playback pacing — wall-clock time when the next frame should be sent.
-        # Zero means "not yet initialised" (reset on every non-playback mode).
+        # Playback pacing: wall-clock time when the next frame should be sent.
         self._pb_wake_time: float = 0.0
-
-        # Playback audio state
-        self._pb_container: av.container.InputContainer | None = None
-        self._pb_resampler: av.audio.resampler.AudioResampler | None = None
-        self._pb_decoder = None  # iterator from container.decode(audio=0)
-        self._pb_fifo: collections.deque = collections.deque()
-        self._pb_path: str | None = None  # path of currently open container
-        self._pb_seek_seconds: float = 0.0
-        self._pb_discard_until_seek: bool = False
-
-    def _open_audio_segment(self, path: str, seek_seconds: float) -> None:
-        """Open an av input container for audio playback. Called in a thread."""
-        self._close_audio_segment()
-        try:
-            container = av.open(path, "r")
-        except Exception as exc:
-            log.warning("Cannot open audio segment %s: %s", path, exc)
-            self._pb_path = path  # mark so we don't retry on every recv()
-            return
-
-        audio_streams = [s for s in container.streams if s.type == "audio"]
-        if not audio_streams:
-            # Recording has no audio track (e.g. pre-audio legacy files).
-            container.close()
-            self._pb_path = path
-            return
-
-        audio_stream = audio_streams[0]
-        seek_seconds = max(0.0, float(seek_seconds))
-        if seek_seconds > 0.05:
-            try:
-                seek_pts = int(seek_seconds / float(audio_stream.time_base))
-                container.seek(
-                    seek_pts,
-                    stream=audio_stream,
-                    backward=True,
-                    any_frame=False,
-                )
-            except Exception as exc:
-                log.debug(
-                    "Audio seek failed for %s at %.2fs: %s", path, seek_seconds, exc
-                )
-
-        layout = "mono" if AUDIO_CHANNELS == 1 else "stereo"
-        resampler = av.audio.resampler.AudioResampler(
-            format="s16p",
-            layout=layout,
-            rate=AUDIO_SAMPLE_RATE,
-            frame_size=AUDIO_FRAME_SAMPLES,
-        )
-
-        self._pb_container = container
-        self._pb_resampler = resampler
-        self._pb_decoder = container.decode(audio=0)
-        self._pb_fifo.clear()
-        self._pb_path = path
-        self._pb_seek_seconds = seek_seconds
-        self._pb_discard_until_seek = seek_seconds > 0.05
-        log.debug("Audio playback opened: %s @ %.2fs", path, seek_seconds)
-
-    def _close_audio_segment(self) -> None:
-        if self._pb_container is not None:
-            try:
-                self._pb_container.close()
-            except Exception:
-                pass
-        self._pb_container = None
-        self._pb_resampler = None
-        self._pb_decoder = None
-        self._pb_fifo.clear()
-        self._pb_path = None
-        self._pb_seek_seconds = 0.0
-        self._pb_discard_until_seek = False
 
     def _make_frame(self, pcm_t: np.ndarray) -> av.AudioFrame:
         """Wrap a (channels, samples) int16 array into a timestamped AudioFrame."""
@@ -536,70 +584,18 @@ class DvrAudioTrack(AudioStreamTrack):
             np.zeros((AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES), dtype=np.int16)
         )
 
-    def _decode_next_into_fifo(self) -> bool:
-        """Decode one packet and push resampled frames into _pb_fifo.
-
-        Returns True if frames were produced, False on EOF or error.
-        Runs synchronously — caller must use asyncio.to_thread.
-        """
-        if self._pb_decoder is None or self._pb_resampler is None:
-            return False
-        try:
-            raw = next(self._pb_decoder, None)
-            if raw is None:
-                return False
-            for rf in self._pb_resampler.resample(raw):
-                frame_time = (
-                    float(rf.pts * rf.time_base) if rf.pts is not None else None
-                )
-                if (
-                    self._pb_discard_until_seek
-                    and frame_time is not None
-                    and frame_time + rf.samples / rf.sample_rate < self._pb_seek_seconds
-                ):
-                    continue
-                self._pb_discard_until_seek = False
-                self._pb_fifo.append(rf.to_ndarray())
-            return True
-        except Exception as exc:
-            log.debug("Audio decode error: %s", exc)
-            return False
-
     async def _recv_playback(self) -> av.AudioFrame:
-        current_path, seek_pos = self._video_track.playback_audio_position()
-
-        # Re-open if the video track switched to a different segment.
-        if current_path != self._pb_path:
-            if current_path:
-                await asyncio.to_thread(
-                    self._open_audio_segment, current_path, seek_pos
-                )
-            else:
-                self._close_audio_segment()
-                return self._silence_frame()
-
-        # No usable container (e.g. legacy file without audio).
-        if self._pb_container is None:
+        pcm = await self._video_track.playback_session.next_audio_pcm()
+        if pcm is None:
             return self._silence_frame()
-
-        # Fill fifo if needed, then pop one frame. Seek can land before target,
-        # so decoding drops early frames until the requested audio timestamp.
-        while not self._pb_fifo:
-            produced = await asyncio.to_thread(self._decode_next_into_fifo)
-            if not produced:
-                return self._silence_frame()
-
-        return self._make_frame(self._pb_fifo.popleft())
+        return self._make_frame(pcm.astype(np.int16, copy=False))
 
     async def recv(self) -> av.AudioFrame:
-        """Return the next audio frame to aiortc based on the video track's mode."""
-        mode = self._video_track.mode  # reads video track's mode every call
+        """Return the next audio frame to aiortc based on the video track mode."""
+        mode = self._video_track.mode
 
         if mode == "live":
-            # pull from mic queue
             self._pb_wake_time = 0.0
-            if self._pb_container is not None:
-                self._close_audio_segment()
             frame_duration = AUDIO_FRAME_SAMPLES / AUDIO_SAMPLE_RATE
             try:
                 pcm_data = await asyncio.wait_for(
@@ -610,39 +606,27 @@ class DvrAudioTrack(AudioStreamTrack):
                 pcm_data = np.zeros(
                     (AUDIO_FRAME_SAMPLES, AUDIO_CHANNELS), dtype=np.int16
                 )
-            # sounddevice gives (frames, channels); _make_frame wants (channels, frames)
             return self._make_frame(pcm_data.T.astype(np.int16))
 
-        elif mode == "playback":
-            # Pace to 20 ms per frame so we don't flood the peer's jitter buffer.
-            # Without this, recv() returns instantly and the sender emits hundreds
-            # of packets/second — the receiver drops them all and hears silence.
+        if mode == "playback":
+            # Pace to 20 ms per frame so we don't flood the peer jitter buffer.
             now = time.monotonic()
             if self._pb_wake_time == 0.0:
                 self._pb_wake_time = now
             sleep_for = self._pb_wake_time - now
             if sleep_for > 0.001:
                 await asyncio.sleep(sleep_for)
-            # If we ran late (segment open, seek, etc.) reset to now to avoid
-            # accumulating debt that would produce a burst of frames later.
             self._pb_wake_time = (
                 max(time.monotonic(), self._pb_wake_time)
                 + AUDIO_FRAME_SAMPLES / AUDIO_SAMPLE_RATE
             )
             return await self._recv_playback()
 
-        else:  # gap
-            self._pb_wake_time = 0.0
-            if self._pb_container is not None:
-                self._close_audio_segment()
-            # Pace silence to match the WebRTC audio cadence (20 ms per frame).
-            await asyncio.sleep(AUDIO_FRAME_SAMPLES / AUDIO_SAMPLE_RATE)
-            return self._silence_frame()
+        self._pb_wake_time = 0.0
+        await asyncio.sleep(AUDIO_FRAME_SAMPLES / AUDIO_SAMPLE_RATE)
+        return self._silence_frame()
 
     def release(self) -> None:
-        """Detach from mic source and release playback resources."""
+        """Detach from mic source and release track resources."""
         self._source.unsubscribe(self._subscriber_id)
-        self._close_audio_segment()
         self.stop()
-
-
