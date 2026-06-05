@@ -185,8 +185,8 @@ class CameraStreamer:
                     )
                     if result.rc != mqtt_lib.MQTT_ERR_SUCCESS:
                         log.warning("Heartbeat publish failed rc=%s", result.rc)
-                    else:
-                        log.debug("Heartbeat published")
+                    # else:
+                    #     log.debug("Heartbeat published")
                 except Exception as e:
                     log.warning("Heartbeat failed: %s", e)
 
@@ -296,8 +296,8 @@ class CameraStreamer:
         Direct await here would crash because this is not an async function
         and we are not on the event loop thread.
         """
-        log.debug("Value-store update: %s", payload)
         key = payload.get("key", "")
+        log.debug("Value-store update: key=%r type=%r", key, payload.get("type"))
         if not key.startswith("offer_"):
             log.info("Value-store update ignored (key=%r)", key)
             return

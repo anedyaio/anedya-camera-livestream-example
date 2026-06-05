@@ -460,6 +460,8 @@ class CameraSource:
         self._actual_frame_shape_logged = False
         self._fps_window_started_at = time.monotonic()
         self._fps_window_frames = 0
+        self._last_frame_monotonic = time.monotonic()
+        self._last_capture_stall_log = 0.0
 
         self._is_running = False
         self._capture_task: asyncio.Task | None = None
@@ -469,6 +471,22 @@ class CameraSource:
         if self._capture_task is None:
             self._is_running = True
             self._capture_task = asyncio.create_task(self._capture_loop())
+            self._capture_task.add_done_callback(self._on_capture_done)
+            log.info("Camera capture task started")
+
+    def _on_capture_done(self, task: asyncio.Task) -> None:
+        """Log camera capture exits so heartbeat cannot hide a dead camera."""
+        if task.cancelled():
+            return
+        was_running = self._is_running
+        self._is_running = False
+        try:
+            task.result()
+        except Exception:
+            log.exception("Camera capture task crashed")
+        else:
+            if was_running:
+                log.error("Camera capture task stopped unexpectedly")
 
     def _process_raw_frame(self, raw_frame: np.ndarray) -> tuple[np.ndarray, float]:
         """Motion detection + annotation. Runs in a thread via asyncio.to_thread."""
@@ -573,9 +591,21 @@ class CameraSource:
             loop_start = time.monotonic()
             raw_frame = await asyncio.to_thread(self._read_pyav_frame)
             if raw_frame is None:
+                now_monotonic = time.monotonic()
+                seconds_without_frames = now_monotonic - self._last_frame_monotonic
+                if (
+                    seconds_without_frames >= 5.0
+                    and now_monotonic - self._last_capture_stall_log >= 30.0
+                ):
+                    log.warning(
+                        "Camera capture has produced no frames for %.1fs",
+                        seconds_without_frames,
+                    )
+                    self._last_capture_stall_log = now_monotonic
                 await asyncio.sleep(0.05)
                 continue
 
+            self._last_frame_monotonic = time.monotonic()
             self._update_measured_fps()
 
             # CPU-intensive OpenCV processing runs in a thread to keep event loop free.
@@ -621,7 +651,11 @@ class CameraSource:
         """Stop the capture loop and release the camera device."""
         self._is_running = False
         if self._capture_task:
-            await self._capture_task
+            self._capture_task.remove_done_callback(self._on_capture_done)
+            try:
+                await self._capture_task
+            except Exception:
+                log.exception("Camera capture task failed during shutdown")
             self._capture_task = None
         self._av_container.close()
         log.info("Camera %d released", self.camera_index)
