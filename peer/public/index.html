@@ -65,6 +65,47 @@
       color: #f87171;
     }
 
+    #deviceStatus {
+      font-size: 0.8rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 999px;
+      background: #222;
+      color: #aaa;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    #deviceStatus::before {
+      content: "";
+      width: 0.55rem;
+      height: 0.55rem;
+      border-radius: 50%;
+      background: #777;
+    }
+
+    #deviceStatus.online {
+      background: #14532d;
+      color: #4ade80;
+    }
+
+    #deviceStatus.online::before {
+      background: #4ade80;
+    }
+
+    #deviceStatus.offline {
+      background: #450a0a;
+      color: #f87171;
+    }
+
+    #deviceStatus.offline::before {
+      background: #f87171;
+    }
+
+    #deviceStatus.unknown::before {
+      background: #777;
+    }
+
     video {
       width: 100%;
       max-width: 640px;
@@ -237,6 +278,7 @@
 
 <body>
   <h1>PI CAM</h1>
+  <div id="deviceStatus" class="unknown">Device: —</div>
   <div id="status">Connecting...</div>
   <div id="networkMode">Mode: --</div>
   <video id="video" autoplay playsinline></video>
@@ -304,6 +346,7 @@
 
     // UI references.
     const statusEl = document.getElementById('status');
+    const deviceStatusEl = document.getElementById('deviceStatus');
     const networkModeEl = document.getElementById('networkMode');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
@@ -580,6 +623,70 @@
       };
     }
 
+    // --- Device online/offline status -------------------------------------
+    // The Pi heartbeats Anedya every ~30 s. We ask Anedya's health API whether
+    // the node has been seen within DEVICE_STATUS_THRESHOLD_SECONDS, both as a
+    // live badge (polled) and as a gate before starting a stream.
+    const DEVICE_STATUS_THRESHOLD_SECONDS = 90;
+    const DEVICE_STATUS_POLL_MS = 10000;
+    let deviceStatusTimer = null;
+
+    // Returns { online, lastHeartbeat } for the configured node, or throws.
+    async function fetchNodeHealth() {
+      const nodeId = getNodeId();
+      const resp = await fetch(`${ANEDYA_API_BASE}/health/status`, {
+        method: 'POST',
+        headers: getVsHeaders(),
+        body: JSON.stringify({
+          nodes: [nodeId],
+          lastContactThreshold: DEVICE_STATUS_THRESHOLD_SECONDS,
+        }),
+      });
+      if (!resp.ok) throw new Error(`Health check failed: ${resp.status}`);
+      const json = await resp.json();
+      if (json.success === false) {
+        throw new Error(json.error || json.reasonCode || 'health error');
+      }
+      const info = json.data?.[nodeId];
+      if (!info) throw new Error('health API returned no data for this node');
+      return info;
+    }
+
+    function setDeviceStatus(state, text) {
+      deviceStatusEl.className = state; // 'online' | 'offline' | 'unknown'
+      deviceStatusEl.textContent = text;
+    }
+
+    // Refresh the badge once. Never throws — network/config problems just show
+    // as "unknown" so the poller keeps running.
+    async function refreshDeviceStatus() {
+      if (!getNodeId()) { setDeviceStatus('unknown', 'Device: set Node ID'); return; }
+      if (!getApiKey()) { setDeviceStatus('unknown', 'Device: set API key'); return; }
+      try {
+        const info = await fetchNodeHealth();
+        if (info.online) {
+          const t = info.lastHeartbeat
+            ? new Date(info.lastHeartbeat * 1000).toLocaleTimeString()
+            : '—';
+          setDeviceStatus('online', `Device: ONLINE (last ${t})`);
+        } else {
+          const t = info.lastHeartbeat
+            ? new Date(info.lastHeartbeat * 1000).toLocaleString()
+            : 'never';
+          setDeviceStatus('offline', `Device: OFFLINE (last ${t})`);
+        }
+      } catch (err) {
+        setDeviceStatus('unknown', 'Device: status unknown');
+      }
+    }
+
+    // Start (or restart) the background poll. Call after settings change.
+    function startDeviceStatusPolling() {
+      if (deviceStatusTimer) clearInterval(deviceStatusTimer);
+      refreshDeviceStatus();
+      deviceStatusTimer = setInterval(refreshDeviceStatus, DEVICE_STATUS_POLL_MS);
+    }
+
     function buildIceConfig(relayData) {
       /*
         PeerConnection config for browser side.
@@ -633,6 +740,8 @@
       }
       uiLog(`Settings saved (${nodeId ? 'node set' : 'node missing'}, ${value ? 'key set' : 'key missing'})`);
       settingsPanel.style.display = 'none';
+      // Re-check device status immediately against the new node/key.
+      startDeviceStatusPolling();
     });
 
     relayOnlyToggle?.addEventListener('change', () => {
@@ -662,8 +771,34 @@
 
       startBtn.disabled = true;
       stopBtn.disabled = false;
-      statusEl.textContent = 'Fetching TURN credentials...';
       statusEl.className = '';
+
+      // Step 0: bail out early if the Pi is offline — no point handshaking a
+      // device that has not heartbeated recently.
+      statusEl.textContent = 'Checking device status...';
+      try {
+        const info = await fetchNodeHealth();
+        if (!info.online) {
+          const last = info.lastHeartbeat
+            ? new Date(info.lastHeartbeat * 1000).toLocaleString()
+            : 'never';
+          setDeviceStatus('offline', `Device: OFFLINE (last ${last})`);
+          uiLog(`Device is OFFLINE (last heartbeat: ${last})`);
+          statusEl.textContent = 'Device offline';
+          statusEl.className = 'error';
+          resetUI();
+          return;
+        }
+        setDeviceStatus('online', 'Device: ONLINE');
+      } catch (err) {
+        uiLog('Device status check failed: ' + err.message);
+        statusEl.textContent = 'Status check failed';
+        statusEl.className = 'error';
+        resetUI();
+        return;
+      }
+
+      statusEl.textContent = 'Fetching TURN credentials...';
 
       // Step 1: browser asks Anedya for TURN credentials.
       let relayData;
@@ -837,6 +972,7 @@
     statusEl.className = 'connected';
     startBtn.disabled = false;
     syncSettingsUI();
+    startDeviceStatusPolling();
   </script>
 </body>
 

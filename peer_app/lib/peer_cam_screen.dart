@@ -43,6 +43,11 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   bool _isTurnMode = false;
   String _logOutput = '';
 
+  // Device online/offline status (polled from Anedya's health API).
+  String _deviceStatus = 'unknown'; // 'online' | 'offline' | 'unknown'
+  String _deviceStatusText = 'Device: —';
+  Timer? _deviceStatusTimer;
+
   // WebRTC objects
   final RTCVideoRenderer _videoRenderer = RTCVideoRenderer();
   RTCPeerConnection? _peerConnection;
@@ -75,7 +80,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     _videoRenderer.initialize();
     _nodeIdController = TextEditingController();
     _apiKeyController = TextEditingController();
-    _loadSavedSettings();
+    _loadSavedSettings().then((_) => _startDeviceStatusPolling());
   }
 
   /// Reads node ID, API key, and relay-only flag from device storage.
@@ -96,11 +101,14 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     await prefs.setString(prefKeyNodeId, _nodeId);
     await prefs.setString(prefKeyApiKey, _apiKey);
     await prefs.setBool(prefKeyRelayOnly, _forceRelayOnly);
+    // Re-check device status immediately against the new node/key.
+    _startDeviceStatusPolling();
   }
 
   @override
   void dispose() {
     _isDisposed = true;
+    _deviceStatusTimer?.cancel();
     _answerPollTimer?.cancel();
     _timelinePollTimer?.cancel();
     _timelineRenderTimer?.cancel();
@@ -193,6 +201,96 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     relayData['password'] = relayData['credential'];
     relayData['relayExpiry'] = decoded['relayExpiry'];
     return relayData;
+  }
+
+  // --- Device online/offline status ---------------------------------------
+  // The Pi heartbeats Anedya every ~30 s. We ask Anedya's health API whether
+  // the node has been seen within [_deviceStatusThresholdSeconds], both as a
+  // live badge (polled) and as a gate before starting a stream.
+  static const int _deviceStatusThresholdSeconds = 90;
+  static const Duration _deviceStatusPollInterval = Duration(seconds: 10);
+
+  /// Returns the node's health info ({ online, lastHeartbeat }) or throws.
+  Future<Map<String, dynamic>> _fetchNodeHealth() async {
+    final response = await http.post(
+      Uri.parse('$anedyaApiBase/health/status'),
+      headers: _requestHeaders,
+      body: jsonEncode({
+        'nodes': [_nodeId],
+        'lastContactThreshold': _deviceStatusThresholdSeconds,
+      }),
+    );
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw Exception('Health check failed: ${response.statusCode}');
+    }
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception('Malformed health response');
+    }
+    if (decoded['success'] == false) {
+      throw Exception(decoded['error'] ?? decoded['reasonCode'] ?? 'health error');
+    }
+    final info = decoded['data']?[_nodeId];
+    if (info is! Map<String, dynamic>) {
+      throw Exception('health API returned no data for this node');
+    }
+    return info;
+  }
+
+  String _formatClock(DateTime dt) =>
+      '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
+
+  void _setDeviceStatus(String state, String text) {
+    _safeSetState(() {
+      _deviceStatus = state;
+      _deviceStatusText = text;
+    });
+  }
+
+  /// Refreshes the badge once. Never throws — network/config problems just
+  /// show as "unknown" so the poller keeps running.
+  Future<void> _refreshDeviceStatus() async {
+    if (_nodeId.isEmpty) {
+      _setDeviceStatus('unknown', 'Device: set Node ID');
+      return;
+    }
+    if (_apiKey.isEmpty) {
+      _setDeviceStatus('unknown', 'Device: set API key');
+      return;
+    }
+    try {
+      final info = await _fetchNodeHealth();
+      final lastHb = info['lastHeartbeat'];
+      if (info['online'] == true) {
+        final t = lastHb is num
+            ? _formatClock(
+                DateTime.fromMillisecondsSinceEpoch(
+                  lastHb.toInt() * 1000,
+                ).toLocal(),
+              )
+            : '—';
+        _setDeviceStatus('online', 'Device: ONLINE (last $t)');
+      } else {
+        final t = lastHb is num
+            ? DateTime.fromMillisecondsSinceEpoch(
+                lastHb.toInt() * 1000,
+              ).toLocal().toString()
+            : 'never';
+        _setDeviceStatus('offline', 'Device: OFFLINE (last $t)');
+      }
+    } catch (_) {
+      _setDeviceStatus('unknown', 'Device: status unknown');
+    }
+  }
+
+  /// Starts (or restarts) the background poll. Call after settings change.
+  void _startDeviceStatusPolling() {
+    _deviceStatusTimer?.cancel();
+    _refreshDeviceStatus();
+    _deviceStatusTimer = Timer.periodic(
+      _deviceStatusPollInterval,
+      (_) => _refreshDeviceStatus(),
+    );
   }
 
   /// Sends a JSON command to the Pi over the WebRTC data channel.
@@ -369,12 +467,35 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     await _closePeerConnection();
 
     _safeSetState(() {
-      _statusText = 'Fetching TURN credentials...';
+      _statusText = 'Checking device status...';
       _networkModeText = 'Mode: --';
       _isTurnMode = false;
       _isStreamActive = true;
       _isInErrorState = false;
     });
+
+    // Step 0: bail out early if the Pi is offline — no point handshaking a
+    // device that has not heartbeated recently.
+    try {
+      final info = await _fetchNodeHealth();
+      if (info['online'] != true) {
+        final lastHb = info['lastHeartbeat'];
+        final last = lastHb is num
+            ? DateTime.fromMillisecondsSinceEpoch(
+                lastHb.toInt() * 1000,
+              ).toLocal().toString()
+            : 'never';
+        _setDeviceStatus('offline', 'Device: OFFLINE (last $last)');
+        _handleError('Device is OFFLINE (last heartbeat: $last)');
+        return;
+      }
+      _setDeviceStatus('online', 'Device: ONLINE');
+    } catch (error) {
+      _handleError('Device status check failed: $error');
+      return;
+    }
+
+    _safeSetState(() => _statusText = 'Fetching TURN credentials...');
 
     // Step 1: fetch short-lived TURN credentials from Anedya.
     Map<String, dynamic> turnCredentials;
@@ -726,6 +847,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
                 children: [
                   _buildHeader(),
                   const SizedBox(height: 8),
+                  _buildDeviceStatusBadge(),
+                  const SizedBox(height: 8),
                   _buildStatusBadge(),
                   const SizedBox(height: 8),
                   _buildNetworkModeBadge(),
@@ -791,6 +914,46 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           },
         ),
       ],
+    );
+  }
+
+  Widget _buildDeviceStatusBadge() {
+    Color background;
+    Color foreground;
+    switch (_deviceStatus) {
+      case 'online':
+        background = const Color(0xFF14532D);
+        foreground = const Color(0xFF4ADE80);
+        break;
+      case 'offline':
+        background = const Color(0xFF450A0A);
+        foreground = const Color(0xFFF87171);
+        break;
+      default:
+        background = const Color(0xFF222222);
+        foreground = const Color(0xFFAAAAAA);
+    }
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: background,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 8,
+            height: 8,
+            decoration: BoxDecoration(color: foreground, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 7),
+          Text(
+            _deviceStatusText,
+            style: TextStyle(color: foreground, fontSize: 12.8),
+          ),
+        ],
+      ),
     );
   }
 
