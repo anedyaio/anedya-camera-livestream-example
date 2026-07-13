@@ -106,15 +106,79 @@
       background: #777;
     }
 
-    video {
+    #videoContainer {
+      position: relative;
       width: 100%;
       max-width: 640px;
+    }
+
+    video {
+      width: 100%;
       height: auto;
       background: #111;
       border-radius: 0.75rem;
       object-fit: contain;
       display: block;
     }
+
+    /* Fake fullscreen: we fullscreen the whole <html> (see fullscreenBtn) and
+       expand the container with this body class instead of making the <video>
+       the fullscreen element. If the video were the fullscreen subject, Chrome
+       promotes it to a hardware overlay plane that hides the watermark. */
+    body.fs #videoContainer {
+      position: fixed;
+      inset: 0;
+      max-width: none;
+      width: 100vw;
+      height: 100vh;
+      z-index: 9999;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    body.fs #videoContainer video {
+      max-height: 100vh;
+      border-radius: 0;
+      /* Make the video INELIGIBLE for Chrome's DirectComposition hardware
+         overlay plane, which otherwise composites above all DOM and hides the
+         watermark after 1-2 s. A sub-1 opacity (visually identical) forces the
+         video onto a normal GPU layer where the watermark's z-index wins.
+         See https://issues.chromium.org/issues/40900941 */
+      opacity: 0.999;
+    }
+
+    .watermark {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 9px;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.4);
+      opacity: 0.8;
+      pointer-events: none;
+      font-size: 0.72rem;
+      letter-spacing: 0.02em;
+      color: #fff;
+      z-index: 2147483647;
+      /* Force our own GPU layer so we stay above the video's fullscreen
+         hardware-overlay plane (which otherwise hides us after 1-2 s). */
+      will-change: transform;
+      transform: translateZ(0);
+    }
+
+    .watermark svg {
+      height: 12px;
+      width: auto;
+      display: block;
+    }
+
+    .watermark .st0 { fill: #fff; }
+    .watermark .st1 { fill: #1fa2ff; }
 
     .btn-row {
       display: flex;
@@ -281,7 +345,44 @@
   <div id="deviceStatus" class="unknown">Device: —</div>
   <div id="status">Connecting...</div>
   <div id="networkMode">Mode: --</div>
-  <video id="video" autoplay playsinline></video>
+  <div id="videoContainer">
+    <video id="video" autoplay playsinline></video>
+    <div class="watermark" aria-hidden="true">
+      <span>Powered By</span>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 427.45 85.62" role="img" aria-label="Anedya">
+        <g>
+          <g>
+            <polygon class="st0" points="115.61,23.38 105.39,23.38 89.02,62.25 96.34,62.25 110.53,28.24 124.71,62.25 131.98,62.25 "></polygon>
+            <path class="st0" d="M186.3,23.38v29.88l-19.94-29.88h-10.78v38.88h7.54V31.53l20.49,30.73h10.22V23.38H186.3z"></path>
+            <rect x="219.7" y="23.38" class="st0" width="28.97" height="6.52"></rect>
+            <rect x="213.91" y="23.38" class="st0" width="6.52" height="38.88"></rect>
+            <rect x="219.7" y="39.56" class="st0" width="28.97" height="6.52"></rect>
+            <rect x="219.7" y="55.74" class="st0" width="28.97" height="6.52"></rect>
+            <path class="st0" d="M307.39,25.81c-1.62-1.62-3.55-2.42-5.81-2.42H269.8v38.88h31.77c2.26,0,4.2-0.81,5.81-2.42 c1.59-1.59,2.4-3.53,2.4-5.79V31.6C309.79,29.36,308.98,27.42,307.39,25.81z M302.79,51.81c0,0.97-0.35,1.78-1.04,2.45 c-0.69,0.67-1.5,1.02-2.47,1.02h-22.52V30.35h22.52c0.97,0,1.78,0.35,2.47,1.04s1.04,1.52,1.04,2.49V51.81z"></path>
+            <path class="st0" d="M361.89,23.38l-10.41,17.58L341.1,23.38h-7.98l14.63,24.18v14.7h7.54v-14.7l14.63-24.18H361.89z"></path>
+            <polygon class="st0" points="411.08,23.38 400.86,23.38 384.5,62.25 391.81,62.25 406,28.24 420.19,62.25 427.45,62.25 "></polygon>
+          </g>
+          <g>
+            <path class="st1" d="M71.96,34.55L54.24,16.83c-0.04,0.29-0.12,0.57-0.26,0.83c0.81,3.11,1.77,10.17-4.02,15.96L2.83,80.75 c-1.7,1.7-0.51,4.61,1.9,4.63l30.21,0.25c1.65,0.01,3.24-0.64,4.4-1.8l32.63-32.63C76.56,46.6,76.56,39.15,71.96,34.55z"></path>
+            <path class="st1" d="M35.32,5.38H19.33c-1.49,0-2.69-1.2-2.69-2.69v0c0-1.49,1.2-2.69,2.69-2.69l15.98,0 c1.49,0,2.69,1.2,2.69,2.69v0C38.01,4.18,36.8,5.38,35.32,5.38z"></path>
+            <path class="st1" d="M43.7,13.41H27.72c-1.49,0-2.69-1.2-2.69-2.69v0c0-1.49,1.2-2.69,2.69-2.69H43.7c1.49,0,2.69,1.2,2.69,2.69v0 C46.39,12.21,45.18,13.41,43.7,13.41z"></path>
+            <path class="st1" d="M54.88,21.44H36.37c-1.49,0-2.69-1.2-2.69-2.69v0c0-1.49,1.2-2.69,2.69-2.69h15.98c1.49,0,2.69,1.2,2.69,2.69 v0C55.04,20.24,56.36,21.44,54.88,21.44z"></path>
+            <path class="st1" d="M58.24,24.09H44.75c-1.49,0-2.69,1.2-2.69,2.69c0,1.49,1.2,2.69,2.69,2.69h13.49V24.09z"></path>
+            <circle class="st1" cx="11.34" cy="2.69" r="2.69"></circle>
+            <circle class="st1" cx="2.69" cy="2.69" r="2.69"></circle>
+            <circle class="st1" cx="19.72" cy="10.72" r="2.69"></circle>
+            <circle class="st1" cx="11.07" cy="10.72" r="2.69"></circle>
+            <circle class="st1" cx="28.38" cy="18.75" r="2.69"></circle>
+            <circle class="st1" cx="19.72" cy="18.75" r="2.69"></circle>
+            <circle class="st1" cx="36.8" cy="26.78" r="2.69"></circle>
+            <circle class="st1" cx="28.14" cy="26.78" r="2.69"></circle>
+            <circle class="st1" cx="45.45" cy="35.06" r="2.69"></circle>
+            <circle class="st1" cx="36.8" cy="35.06" r="2.69"></circle>
+          </g>
+        </g>
+      </svg>
+    </div>
+  </div>
 
   <div class="toolbar">
       <button id="fullscreenBtn" type="button">⛶</button>
@@ -713,13 +814,23 @@
     fullscreenBtn.addEventListener('click', async () => {
       try {
         if (!document.fullscreenElement) {
-          await video.requestFullscreen();
+          // Fullscreen the whole document (not the <video> or its container) so
+          // Chrome does NOT promote the video to a hardware overlay plane that
+          // hides the watermark. The `fs` body class (toggled below) then
+          // expands the video container to fill the screen.
+          await document.documentElement.requestFullscreen();
         } else {
           await document.exitFullscreen();
         }
       } catch (err) {
         uiLog('Fullscreen error: ' + err.message);
       }
+    });
+
+    // Keep the `fs` class in sync with actual fullscreen state so it also clears
+    // when the user exits via Esc (which fires no button click).
+    document.addEventListener('fullscreenchange', () => {
+      document.body.classList.toggle('fs', !!document.fullscreenElement);
     });
 
     saveSettingsBtn.addEventListener('click', () => {
