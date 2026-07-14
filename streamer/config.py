@@ -153,6 +153,11 @@ CjAIMAYGBFUdIAAwCgYIKoZIzj0EAwIDRwAwRAIgR/rWSG8+L4XtFLces0JYS7bY
 
 TOPIC_VALUESTORE_UPDATES = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/updates/json"
 TOPIC_VALUESTORE_SET     = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/setValue/json"
+# WebRTC signaling over Anedya Commands (same as the ESP-CAM project). The device
+# subscribes to inbound commands and publishes command status updates that carry
+# the compressed answer SDP. Inbound topic must match the SDK exactly (no /json).
+TOPIC_COMMANDS           = f"$anedya/device/{ANEDYA_DEVICE_ID}/commands"
+TOPIC_COMMAND_STATUS     = f"$anedya/device/{ANEDYA_DEVICE_ID}/commands/updateStatus/json"
 TOPIC_RESPONSES          = f"$anedya/device/{ANEDYA_DEVICE_ID}/response"
 TOPIC_ERRORS             = f"$anedya/device/{ANEDYA_DEVICE_ID}/errors"
 TOPIC_HEARTBEAT          = f"$anedya/device/{ANEDYA_DEVICE_ID}/heartbeat/json"
