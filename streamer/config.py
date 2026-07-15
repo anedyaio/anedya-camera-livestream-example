@@ -7,7 +7,6 @@ validation helper.
 
 Environment variables required (set in streamer/.env — never commit that file):
     ANEDYA_DEVICE_ID       Device UUID from the Anedya console
-    ANEDYA_NODE_ID         Node UUID from the Anedya console
     ANEDYA_CONNECTION_KEY  Device connection key from the Anedya console
     ANEDYA_REGION          API / MQTT region slug  (default: ap-in-1)
 """
@@ -86,7 +85,6 @@ load_env_file(Path.cwd() / ".env")
 
 
 ANEDYA_DEVICE_ID      = os.environ.get("ANEDYA_DEVICE_ID",      "")
-ANEDYA_NODE_ID        = os.environ.get("ANEDYA_NODE_ID",        "")
 ANEDYA_CONNECTION_KEY = os.environ.get("ANEDYA_CONNECTION_KEY", "")
 ANEDYA_REGION         = os.environ.get("ANEDYA_REGION",         "ap-in-1")
 
@@ -227,7 +225,6 @@ def validate_anedya_config() -> None:
         name
         for name, value in {
             "ANEDYA_DEVICE_ID":      ANEDYA_DEVICE_ID,
-            "ANEDYA_NODE_ID":        ANEDYA_NODE_ID,
             "ANEDYA_CONNECTION_KEY": ANEDYA_CONNECTION_KEY,
         }.items()
         if not value
