@@ -514,7 +514,7 @@ class CameraSource:
 
             elapsed    = time.monotonic() - loop_start
             sleep_time = max(0.0, frame_interval - elapsed)
-            await asyncio.sleep(sleep_time)
+            # await asyncio.sleep(sleep_time)
 
     async def get_next_frame(self, last_known_sequence: int) -> tuple[int, np.ndarray, float]:
         """Wait until a frame newer than last_known_sequence is available.
