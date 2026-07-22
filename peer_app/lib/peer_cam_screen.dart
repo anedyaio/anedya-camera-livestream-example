@@ -1,13 +1,18 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'qr_code_scanner.dart';
+import 'sdp_compressor.dart';
+// QR pairing is disabled — the Node ID is entered manually in Settings. Kept
+// here (commented) in case scan-to-pair is wanted again; also uncomment the
+// import below and the QR IconButton in _buildHeader, and re-add mobile_scanner
+// to pubspec.yaml if restored.
+// import 'qr_code_scanner.dart';
 
 const String anedyaApiBase = 'https://api.ap-in-1.anedya.io/v1';
 
@@ -53,7 +58,8 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   RTCPeerConnection? _peerConnection;
   RTCDataChannel? _dataChannel; // ordered channel named "control"
   MediaStreamTrack? _audioTrack;
-  Timer? _answerPollTimer; // polls ValueStore for the Pi's SDP answer
+  Timer? _answerPollTimer; // polls the command status for the Pi's SDP answer
+  SdpCompressor? _sdpCompressor; // zstd+dict codec for signaling payloads
   Timer? _timelinePollTimer; // requests timeline state from Pi every 2 s
   Timer? _timelineRenderTimer; // locally smooths timeline between snapshots
   bool _isDisposed = false;
@@ -81,6 +87,18 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     _nodeIdController = TextEditingController();
     _apiKeyController = TextEditingController();
     _loadSavedSettings().then((_) => _startDeviceStatusPolling());
+    // Warm up the zstd codec + dictionary so the first Start is not delayed.
+    _initSdpCompressor();
+  }
+
+  /// Loads the zstd codec + shared dictionary. Never throws — a failure just
+  /// leaves [_sdpCompressor] null so [_startStream] can report it clearly.
+  Future<void> _initSdpCompressor() async {
+    try {
+      _sdpCompressor = await SdpCompressor.instance();
+    } catch (error) {
+      _appendLog('zstd init failed: $error');
+    }
   }
 
   /// Reads node ID, API key, and relay-only flag from device storage.
@@ -127,53 +145,81 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   void _appendLog(String message) =>
       _safeSetState(() => _logOutput += '$message\n');
 
-  // HTTP headers
+  // HTTP headers. The key may already carry a "Bearer " prefix (the Settings
+  // hint says it is optional), so only add one when it is missing.
   Map<String, String> get _requestHeaders => {
     'Content-Type': 'application/json',
     'Accept': 'application/json',
-    'Authorization': 'Bearer $_apiKey',
+    'Authorization': _apiKey.toLowerCase().startsWith('bearer ')
+        ? _apiKey
+        : 'Bearer $_apiKey',
   };
 
-  // ValueStore namespace scopes all keys to this specific Pi node.
-  Map<String, dynamic> get _valueStoreNamespace => {
-    'scope': 'node',
-    'id': _nodeId,
-  };
+  // --- WebRTC signaling over Anedya Commands ------------------------------
+  // The offer is sent as the "webrtc_offer" command; the Pi replies by
+  // attaching the compressed answer SDP as this command's ackdata while the
+  // command is "processing", then concludes success/failure.
 
-  /// Writes [value] under [key] in this node's ValueStore.
-  /// Used to publish the SDP offer so the Pi can read it over MQTT.
-  Future<void> _writeToValueStore(String key, String value) async {
+  /// Sends the compressed offer as a command. Returns the Anedya-assigned
+  /// commandId, which correlates the answer back to this offer.
+  Future<String> _sendOfferViaCommand(String dataB64) async {
     final response = await http.post(
-      Uri.parse('$anedyaApiBase/valuestore/setValue'),
+      Uri.parse('$anedyaApiBase/commands/send'),
       headers: _requestHeaders,
       body: jsonEncode({
-        'namespace': _valueStoreNamespace,
-        'key': key,
-        'value': value,
+        'nodeId': _nodeId,
+        'command': 'webrtc_offer',
+        'data': dataB64,
+        // "string": the compressed offer base64 is well under the 1023-char cap.
+        // (Binary type mangles the inbound command payload on the device side,
+        // so we keep the offer as string.)
         'type': 'string',
+        'expiry': DateTime.now().millisecondsSinceEpoch + 300000,
       }),
     );
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw Exception(
-        'ValueStore write failed: ${response.statusCode} ${response.body}',
+        'Command send failed: ${response.statusCode} ${response.body}',
       );
     }
+    final decoded = jsonDecode(response.body);
+    if (decoded is! Map<String, dynamic>) {
+      throw Exception('Command send returned malformed response');
+    }
+    // Field name has varied across API versions; accept whichever is present.
+    final commandId =
+        decoded['commandId'] ?? decoded['id'] ?? decoded['commandID'];
+    if (commandId is! String || commandId.isEmpty) {
+      throw Exception('Command send returned no id: ${response.body}');
+    }
+    return commandId;
   }
 
-  /// Reads [key] from this node's ValueStore.
-  /// Returns null if the key does not exist yet or on HTTP error.
-  /// Used to poll for the Pi's SDP answer.
-  Future<String?> _readFromValueStore(String key) async {
+  /// Removes non-relay ICE candidate lines from an SDP, keeping `typ relay`
+  /// candidates and all other lines. Shrinks the offer so it fits the command
+  /// payload cap; connectivity is unaffected because both peers use the shared
+  /// TURN relay bundled with the offer.
+  String _stripNonRelayCandidates(String sdp) {
+    final lines = sdp.split('\n');
+    final kept = lines.where((line) {
+      final trimmed = line.trim();
+      if (!trimmed.startsWith('a=candidate:')) return true;
+      return trimmed.contains('typ relay');
+    });
+    return kept.join('\n');
+  }
+
+  /// Polls a command's details: status + ackdata (base64(zstd(answer SDP))).
+  /// Returns null on HTTP/parse error so the poller keeps trying.
+  Future<Map<String, dynamic>?> _getCommandStatus(String commandId) async {
     final response = await http.post(
-      Uri.parse('$anedyaApiBase/valuestore/getValue'),
+      Uri.parse('$anedyaApiBase/commands/getDetails'),
       headers: _requestHeaders,
-      body: jsonEncode({'namespace': _valueStoreNamespace, 'key': key}),
+      body: jsonEncode({'commandId': commandId}),
     );
     if (response.statusCode < 200 || response.statusCode >= 300) return null;
     final decoded = jsonDecode(response.body);
-    if (decoded is! Map<String, dynamic>) return null;
-    final value = decoded['value'];
-    return value is String && value.isNotEmpty ? value : null;
+    return decoded is Map<String, dynamic> ? decoded : null;
   }
 
   /// Asks Anedya to provision a short-lived TURN relay for this session.
@@ -454,11 +500,12 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   }
 
   /// Runs the full WebRTC signaling flow:
+  ///   Step 0 → gate on device online status (don't handshake an offline Pi)
   ///   Step 1 → fetch TURN credentials
   ///   Step 2 → create peer connection + data channel + transceivers
   ///   Step 3 → create SDP offer, gather ICE candidates
-  ///   Step 4 → write offer + TURN data to ValueStore (Pi reads this over MQTT)
-  ///   Step 5 → poll ValueStore for Pi's answer, apply it
+  ///   Step 4 → send offer + TURN data as the "webrtc_offer" command (zstd+dict)
+  ///   Step 5 → poll the command status for the Pi's answer + terminal result
   Future<void> _startStream() async {
     _answerPollTimer?.cancel();
     _timelinePollTimer?.cancel();
@@ -647,65 +694,118 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
         );
       }
 
-      // Step 4: write the offer + TURN credentials to ValueStore.
-      // The Pi receives this as an MQTT notification and begins its answer flow.
-      // TURN credentials are bundled so both sides use the same relay allocation.
-      final sessionId = _generateSessionId();
-      final offerKey = 'offer_$sessionId';
-      final answerKey = 'answer_$sessionId';
+      // Step 4: send the offer + TURN credentials as the "webrtc_offer" command.
+      // The Pi receives this over MQTT and begins its answer flow. TURN
+      // credentials are bundled so both sides use the same relay allocation.
+      final codec = _sdpCompressor;
+      if (codec == null) {
+        throw Exception('zstd codec not ready');
+      }
+
+      // The command payload has a hard ~1023-char cap. Two size reductions keep
+      // a full media SDP under budget after zstd+dict:
+      //   1. Drop non-relay ICE candidates. Both sides reach each other through
+      //      the shared TURN relay bundled below, so host/srflx candidates in
+      //      the offer add bytes (and entropy the dictionary can't model)
+      //      without changing connectivity.
+      //   2. Send only the three TURN fields the Pi actually reads
+      //      (endpoint/username/credential) — the rest is duplicated or unused.
+      final trimmedSdp = _stripNonRelayCandidates(localDescription.sdp ?? '');
+      final trimmedTurn = {
+        'endpoint': turnCredentials['endpoint'],
+        'username': turnCredentials['username'],
+        'credential': turnCredentials['credential'],
+      };
+      final offerJson = jsonEncode({
+        'offer': {'sdp': trimmedSdp, 'type': localDescription.type},
+        'turn': trimmedTurn,
+      });
+      // Compress (zstd + shared dict) + base64; the Pi decompresses with the
+      // identical dictionary. This is what makes a full media SDP fit a command.
+      final payload = codec.compressToBase64(offerJson);
+      _appendLog(
+        'Offer: raw=${offerJson.length}B -> command payload=${payload.length}B',
+      );
+      if (payload.length > 1023) {
+        throw Exception(
+          'Offer payload ${payload.length}B exceeds the 1023-char command cap',
+        );
+      }
 
       _safeSetState(() => _statusText = 'Sending offer...');
-      await _writeToValueStore(
-        offerKey,
-        jsonEncode({
-          'offer': {'sdp': localDescription.sdp, 'type': localDescription.type},
-          'turn': turnCredentials,
-        }),
-      );
-      _appendLog('Offer written (key=$offerKey) - polling for answer...');
+      final commandId = await _sendOfferViaCommand(payload);
+      _appendLog('Offer sent (commandId=$commandId) - polling for answer...');
       _safeSetState(() => _statusText = 'Waiting for Pi...');
 
-      // Step 5: poll for the Pi's answer.
-      _startPollingForAnswer(answerKey);
+      // Step 5: poll the command status for the Pi's answer + terminal result.
+      _startPollingForAnswer(commandId, codec);
     } catch (error) {
       _handleError('Offer flow error: $error');
       stopStream(logStop: false);
     }
   }
 
-  /// Polls ValueStore every 2 seconds for up to 60 seconds (30 attempts).
-  /// Once the Pi's answer arrives, sets the remote description to complete
-  /// the WebRTC handshake and allow media to flow.
-  void _startPollingForAnswer(String answerKey) {
+  /// Polls the command status every 2 seconds for up to 90 seconds (45
+  /// attempts). While the command is "processing" the Pi attaches the answer
+  /// SDP as ackdata; applying it completes the handshake. The Pi then concludes
+  /// the command "success" or "failure" (terminal).
+  void _startPollingForAnswer(String commandId, SdpCompressor codec) {
     int pollAttempts = 0;
+    bool answerApplied = false;
+    const maxAttempts = 45;
     _answerPollTimer = Timer.periodic(const Duration(seconds: 2), (
       timer,
     ) async {
       pollAttempts++;
-      if (pollAttempts > 30) {
+      if (pollAttempts > maxAttempts) {
         timer.cancel();
         _answerPollTimer = null;
-        _handleError('Timeout: Pi did not respond in time');
-        stopStream(logStop: false);
+        if (!answerApplied) {
+          _handleError('Timeout: Pi did not respond in time');
+          stopStream(logStop: false);
+        }
         return;
       }
       try {
-        final answerPayload = await _readFromValueStore(answerKey);
-        if (answerPayload == null) {
-          return; // not written yet — try again next tick
+        final cmd = await _getCommandStatus(commandId);
+        if (cmd == null) {
+          _appendLog('Status fetch failed ($pollAttempts)');
+          return; // try again next tick
         }
-        timer.cancel();
-        _answerPollTimer = null;
-        final answerSdp = jsonDecode(answerPayload) as Map<String, dynamic>;
-        await _peerConnection?.setRemoteDescription(
-          RTCSessionDescription(
-            answerSdp['sdp'] as String,
-            answerSdp['type'] as String,
-          ),
-        );
-        _appendLog('Answer applied - WebRTC connecting...');
+
+        final status = cmd['status'];
+        if (status == 'failure') {
+          timer.cancel();
+          _answerPollTimer = null;
+          _appendLog('Command status=failure: ${cmd['ackdata'] ?? cmd['error'] ?? ''}');
+          _handleError('Pi reported failure');
+          stopStream(logStop: false);
+          return;
+        }
+        if (status == 'success') {
+          timer.cancel();
+          _answerPollTimer = null;
+          _appendLog('Command status=success (Pi confirmed connection)');
+          return;
+        }
+
+        // The answer SDP rides in ackdata while status is "processing".
+        final ackData = cmd['ackdata'];
+        if (!answerApplied && ackData is String && ackData.isNotEmpty) {
+          answerApplied = true;
+          // Same compression as the offer, reversed.
+          final answerSdp =
+              jsonDecode(codec.decompressFromBase64(ackData)) as Map<String, dynamic>;
+          await _peerConnection?.setRemoteDescription(
+            RTCSessionDescription(
+              answerSdp['sdp'] as String,
+              answerSdp['type'] as String,
+            ),
+          );
+          _appendLog('Answer applied - WebRTC connecting...');
+        }
       } catch (error) {
-        _appendLog('Poll error: $error');
+        _appendLog('Poll/apply answer error: $error');
       }
     });
   }
@@ -797,14 +897,6 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
     });
   }
 
-  /// Generates a random 8-character alphanumeric session ID to namespace the
-  /// offer/answer ValueStore keys so concurrent sessions do not collide.
-  String _generateSessionId() {
-    const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
-    final random = Random.secure();
-    return List.generate(8, (_) => chars[random.nextInt(chars.length)]).join();
-  }
-
   // Status badge colors
   Color get _statusBackgroundColor {
     if (_isInErrorState) return const Color(0xFF450A0A);
@@ -880,10 +972,10 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
   }
 
   Widget _buildHeader() {
-    return Row(
+    return const Row(
       mainAxisAlignment: MainAxisAlignment.center,
       children: [
-        const Text(
+        Text(
           'PI CAM',
           style: TextStyle(
             color: Color(0xFFEEEEEE),
@@ -891,28 +983,31 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
             letterSpacing: 0.95,
           ),
         ),
-        // QR icon opens the scanner. The streamer prints a QR payload on startup
-        // that encodes the node_id — scan it instead of typing the UUID manually.
-        IconButton(
-          icon: const Icon(Icons.qr_code_scanner, color: Colors.white),
-          onPressed: () async {
-            await Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => QRScannerScreen(
-                  onNodeIdScanned: (scannedNodeId) {
-                    _safeSetState(() {
-                      _nodeId = scannedNodeId;
-                      _nodeIdController.text = scannedNodeId;
-                      _statusText = 'Node set via QR';
-                    });
-                    _saveSettings();
-                  },
-                ),
-              ),
-            );
-          },
-        ),
+        // QR pairing is disabled — the Node ID is entered manually in Settings.
+        // To restore scan-to-pair: re-add mobile_scanner to pubspec.yaml,
+        // uncomment the qr_code_scanner import at the top of this file, and
+        // restore the IconButton below.
+        //
+        // IconButton(
+        //   icon: const Icon(Icons.qr_code_scanner, color: Colors.white),
+        //   onPressed: () async {
+        //     await Navigator.push(
+        //       context,
+        //       MaterialPageRoute(
+        //         builder: (_) => QRScannerScreen(
+        //           onNodeIdScanned: (scannedNodeId) {
+        //             _safeSetState(() {
+        //               _nodeId = scannedNodeId;
+        //               _nodeIdController.text = scannedNodeId;
+        //               _statusText = 'Node set via QR';
+        //             });
+        //             _saveSettings();
+        //           },
+        //         ),
+        //       ),
+        //     );
+        //   },
+        // ),
       ],
     );
   }
@@ -992,19 +1087,37 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
       aspectRatio: 16 / 9,
       child: ClipRRect(
         borderRadius: BorderRadius.circular(12),
-        child: Container(
-          color: const Color(0xFF111111),
-          child: _videoRenderer.srcObject == null
-              ? const Center(
-                  child: Text(
-                    'Video Feed',
-                    style: TextStyle(color: Color(0xFFEEEEEE), fontSize: 14),
-                  ),
-                )
-              : RTCVideoView(
-                  _videoRenderer,
-                  objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
-                ),
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: Container(
+                color: const Color(0xFF111111),
+                child: _videoRenderer.srcObject == null
+                    ? const Center(
+                        child: Text(
+                          'Video Feed',
+                          style: TextStyle(
+                            color: Color(0xFFEEEEEE),
+                            fontSize: 14,
+                          ),
+                        ),
+                      )
+                    : RTCVideoView(
+                        _videoRenderer,
+                        objectFit:
+                            RTCVideoViewObjectFit.RTCVideoViewObjectFitContain,
+                      ),
+              ),
+            ),
+            // "Powered By Anedya" watermark, mirroring the browser viewer.
+            // Shown only while media is flowing.
+            if (_videoRenderer.srcObject != null)
+              const Positioned(
+                right: 10,
+                bottom: 10,
+                child: _AnedyaWatermark(),
+              ),
+          ],
         ),
       ),
     );
@@ -1173,7 +1286,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           _buildInputField(
             label: 'Anedya API Key',
             controller: _apiKeyController,
-            hint: 'Raw API key (no Bearer prefix)',
+            hint: 'Bearer ...',
             obscureText: true,
           ),
           const SizedBox(height: 14),
@@ -1204,7 +1317,7 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           const SizedBox(height: 10),
           const Text(
             'Node ID and API key are stored on this device via SharedPreferences. '
-            'Enter the raw API key — Bearer is added automatically.',
+            'Prefix the key with Bearer if your token needs it.',
             style: TextStyle(
               color: Color(0x80EEEEEE),
               fontSize: 12,
@@ -1341,6 +1454,41 @@ class _PeerCamScreenState extends State<PeerCamScreen> {
           color: Color(0x80EEEEEE),
           fontSize: 12,
           height: 1.6,
+        ),
+      ),
+    );
+  }
+}
+
+/// "Powered By" + Anedya logo watermark overlaid on the video feed, mirroring
+/// the browser viewer's corner badge (text + the same SVG mark at ~12px tall).
+class _AnedyaWatermark extends StatelessWidget {
+  const _AnedyaWatermark();
+
+  @override
+  Widget build(BuildContext context) {
+    return Opacity(
+      opacity: 0.8,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 4),
+        decoration: BoxDecoration(
+          color: const Color(0x66000000),
+          borderRadius: BorderRadius.circular(6),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              'Powered By',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                letterSpacing: 0.2,
+              ),
+            ),
+            const SizedBox(width: 6),
+            SvgPicture.asset('assets/anedya_logo.svg', height: 12),
+          ],
         ),
       ),
     );

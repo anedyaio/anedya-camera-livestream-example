@@ -14,6 +14,14 @@ dependencies:
   http: ^1.6.0
   mobile_scanner: ^7.2.0
   shared_preferences: ^2.3.0
+  ffi: ^2.1.0
+  flutter_svg: ^2.0.0
+  # zstd (bundled libzstd + generated FFI bindings). Used to compress the
+  # WebRTC signaling SDP with a shared trained dictionary so a full offer/answer
+  # fits inside an Anedya command payload (~1023-char cap). The dictionary bytes
+  # in assets/signaling_dict.bin MUST match streamer/signaling_dict.bin.
+  zstandard: ^1.5.0
+  zstandard_native: ^1.5.0
 
 dev_dependencies:
   flutter_test:
@@ -22,3 +30,6 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/signaling_dict.bin
+    - assets/anedya_logo.svg
