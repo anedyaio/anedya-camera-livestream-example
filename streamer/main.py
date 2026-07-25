@@ -1,9 +1,9 @@
 """
 Pi Cam device process — entrypoint.
 
-Parses command-line arguments, validates Anedya credentials, prints a QR code
-for easy peer pairing, then hands control to CameraStreamer which manages
-recording, MQTT signaling, and WebRTC sessions for the lifetime of the process.
+Parses command-line arguments, validates Anedya credentials, then hands control
+to CameraStreamer which manages recording, MQTT signaling, and WebRTC sessions
+for the lifetime of the process.
 
 Usage:
     uv run streamer                        # default camera, audio on
@@ -13,44 +13,32 @@ Usage:
 
 Environment variables (or streamer/.env):
     ANEDYA_DEVICE_ID       Device UUID from the Anedya console
-    ANEDYA_NODE_ID         Node UUID from the Anedya console
     ANEDYA_CONNECTION_KEY  Device connection key from the Anedya console
     ANEDYA_REGION          API region slug (default: ap-in-1)
 """
 
 import argparse
 import asyncio
-import json
 import logging
 
-import qrcode
-
 from camera_streamer import CameraStreamer
-from config import ANEDYA_DEVICE_ID, ANEDYA_NODE_ID, validate_anedya_config
+from config import validate_anedya_config
 
 log = logging.getLogger("streamer")
 
 
-def display_qr_code() -> None:
-    """Print a QR code containing the node and device IDs.
-
-    The peer app scans this to learn which Anedya node to connect to,
-    eliminating the need to manually copy-paste UUIDs.
-    """
-    payload = json.dumps(
-        {
-            "node_id": ANEDYA_NODE_ID,
-            "device_id": ANEDYA_DEVICE_ID,
-        }
-    )
-
-    qr = qrcode.QRCode(border=2)
-    qr.add_data(payload)
-    qr.make(fit=True)
-
-    print("\nScan this QR to connect:\n")
-    qr.print_ascii(invert=True)
-    print("\nPayload:", payload, "\n")
+# QR pairing is disabled — the peer's Node ID is entered manually. Kept here
+# (commented) in case scan-to-pair is wanted again; also re-add `import json`,
+# `import qrcode`, and ANEDYA_NODE_ID/ANEDYA_DEVICE_ID from config if restored.
+# def display_qr_code() -> None:
+#     """Print a QR code containing the node and device IDs."""
+#     payload = json.dumps({"node_id": ANEDYA_NODE_ID, "device_id": ANEDYA_DEVICE_ID})
+#     qr = qrcode.QRCode(border=2)
+#     qr.add_data(payload)
+#     qr.make(fit=True)
+#     print("\nScan this QR to connect:\n")
+#     qr.print_ascii(invert=True)
+#     print("\nPayload:", payload, "\n")
 
 
 async def main(
@@ -110,7 +98,6 @@ def cli() -> None:
         args.record_path,
     )
     validate_anedya_config()
-    display_qr_code()
 
     # Run the main async function
     asyncio.run(

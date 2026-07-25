@@ -396,12 +396,10 @@
   </div>
 
   <div class="toggle-row">
-    <!--
     <label class="toggle">
       <input id="relayOnlyToggle" type="checkbox" />
       <span>Force relay/TURN only</span>
     </label>
-    -->
     <label class="toggle">
       <input id="muteToggle" type="checkbox" />
       <span>Mute audio</span>
@@ -432,6 +430,51 @@
   </div>
 
   <pre id="log"></pre>
+
+  <!--
+    zstd + trained-dictionary compression for signaling payloads.
+    The offer (and the Pi's answer) are large WebRTC SDPs whose bulk is constant
+    boilerplate. A shared trained dictionary lets each payload carry only its
+    deltas, shrinking the value-store payload dramatically. This module exposes
+    window.sdpCompress / sdpDecompress once the WASM + dictionary are ready.
+    The dictionary bytes MUST match streamer/signaling_dict.bin on the device.
+  -->
+  <script type="module">
+    import { init, createCCtx, compressUsingDict, createDCtx, decompressUsingDict }
+      from './vendor/zstd/index.web.js';
+
+    const ZSTD_LEVEL = 19;
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+
+    const bytesToB64 = (u8) => {
+      let s = '';
+      for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+      return btoa(s);
+    };
+    const b64ToBytes = (b64) => {
+      const bin = atob(b64);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      return u8;
+    };
+
+    // Resolves once WASM is initialized and the dictionary is loaded. Signaling
+    // code awaits this before compressing/decompressing.
+    window.zstdReady = (async () => {
+      await init();
+      const dict = new Uint8Array(
+        await (await fetch('./vendor/zstd-dict.bin')).arrayBuffer());
+
+      // JSON string -> base64(zstd-with-dict)
+      window.sdpCompress = (jsonStr) =>
+        bytesToB64(compressUsingDict(createCCtx(), encoder.encode(jsonStr), dict, ZSTD_LEVEL));
+
+      // base64(zstd-with-dict) -> JSON string
+      window.sdpDecompress = (b64) =>
+        decoder.decode(decompressUsingDict(createDCtx(), b64ToBytes(b64), dict));
+    })();
+  </script>
 
   <script>
     /*
@@ -706,6 +749,50 @@
       const json = await resp.json();
       if (!json.value) return null;
       return json.value;
+    }
+
+    // --- WebRTC signaling over Anedya Commands -----------------------------
+    // The offer is sent as the "webrtc_offer" command; the Pi replies by
+    // attaching the compressed answer SDP as this command's ackdata.
+
+    // Send the compressed offer as a command. Returns the Anedya-assigned
+    // commandId, which correlates the answer back to this offer.
+    async function sendOfferViaCommand(dataB64) {
+      const resp = await fetch(`${ANEDYA_API_BASE}/commands/send`, {
+        method: 'POST',
+        headers: getVsHeaders(),
+        body: JSON.stringify({
+          nodeId: getNodeId(),
+          command: 'webrtc_offer',
+          data: dataB64,
+          // "string": the compressed offer base64 (~570 B) is well under the
+          // 1023-char cap. (Binary type mangles the inbound command payload on
+          // the device side, so we keep the offer as string.)
+          type: 'string',
+          expiry: Date.now() + 300_000,
+        }),
+      });
+      if (!resp.ok) {
+        throw new Error(`Command send failed: ${resp.status} ${await resp.text()}`);
+      }
+      const json = await resp.json();
+      // Field name has varied across API versions; accept whichever is present.
+      const commandId = json.commandId || json.id || json.commandID;
+      if (!commandId) {
+        throw new Error(`Command send returned no id: ${JSON.stringify(json)}`);
+      }
+      return commandId;
+    }
+
+    // Poll a command's details: status + ackdata (base64(zstd(answer SDP))).
+    async function getCommandStatus(commandId) {
+      const resp = await fetch(`${ANEDYA_API_BASE}/commands/getDetails`, {
+        method: 'POST',
+        headers: getVsHeaders(),
+        body: JSON.stringify({ commandId }),
+      });
+      if (!resp.ok) return null;
+      return await resp.json();
     }
 
     async function fetchTurnCredentials() {
@@ -1027,52 +1114,76 @@
         uiLog('Warning: Failed to create relay candidate. Please check your quota limits.');
       }
 
-      // Step 4: write offer + TURN data into Anedya value store.
-      const sessionId = Math.random().toString(36).slice(2, 10);
-      const offerKey = `offer_${sessionId}`;
-      const answerKey = `answer_${sessionId}`;
-
+      // Step 4: send the offer as the "webrtc_offer" command.
+      let commandId;
       try {
         statusEl.textContent = 'Sending offer...';
-        const payload = JSON.stringify({
+        await window.zstdReady;
+        const offerJson = JSON.stringify({
           offer: { sdp: pc.localDescription.sdp, type: pc.localDescription.type },
           turn: relayData
         });
-        await vsSet(offerKey, payload);
-        uiLog(`Offer written (key=${offerKey}) - polling for answer...`);
+        // Compress (zstd + shared dict) + base64; the Pi decompresses with the
+        // identical dictionary. This is what makes a full media SDP fit a command.
+        const payload = window.sdpCompress(offerJson);
+        uiLog(`Offer: raw=${offerJson.length}B -> command payload=${payload.length}B`);
+        commandId = await sendOfferViaCommand(payload);
+        uiLog(`Offer sent (commandId=${commandId}) - polling for answer...`);
         statusEl.textContent = 'Waiting for Pi...';
       } catch (err) {
-        uiLog('Error writing offer: ' + err.message);
+        uiLog('Error sending offer: ' + err.message);
         statusEl.textContent = 'Error';
         statusEl.className = 'error';
         resetUI();
         return;
       }
 
-      // Step 5: poll for answer. Device writes answer into `answer_<sessionId>`.
+      // Step 5: poll the command status. The Pi attaches the compressed answer
+      // SDP as ackdata while status is "processing", then concludes success/failure.
       let attempts = 0;
-      const MAX_ATTEMPTS = 30;
+      let answerApplied = false;
+      const MAX_ATTEMPTS = 45;
       pollTimer = setInterval(async () => {
         attempts++;
         if (attempts > MAX_ATTEMPTS) {
           clearInterval(pollTimer); pollTimer = null;
-          uiLog('Timeout: Pi did not respond in time');
-          statusEl.textContent = 'Timeout';
-          statusEl.className = 'error';
-          stopStream();
+          if (!answerApplied) {
+            uiLog('Timeout: Pi did not respond in time');
+            statusEl.textContent = 'Timeout';
+            statusEl.className = 'error';
+            stopStream();
+          }
           return;
         }
 
         try {
-          const value = await vsGet(answerKey);
-          if (value) {
+          const cmd = await getCommandStatus(commandId);
+          if (!cmd) { uiLog(`Status fetch failed (${attempts})`); return; }
+
+          if (cmd.status === 'failure') {
             clearInterval(pollTimer); pollTimer = null;
-            const answerSdp = JSON.parse(value);
+            uiLog(`Command status=failure: ${cmd.ackdata || cmd.error || ''}`);
+            statusEl.textContent = 'Pi reported failure';
+            statusEl.className = 'error';
+            stopStream();
+            return;
+          }
+          if (cmd.status === 'success') {
+            clearInterval(pollTimer); pollTimer = null;
+            uiLog('Command status=success (Pi confirmed connection)');
+            return;
+          }
+
+          // The answer SDP rides in ackdata while status is "processing".
+          if (!answerApplied && cmd.ackdata) {
+            answerApplied = true;
+            // Same compression as the offer, reversed.
+            const answerSdp = JSON.parse(window.sdpDecompress(cmd.ackdata));
             await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
             uiLog('Answer applied - WebRTC connecting...');
           }
         } catch (err) {
-          uiLog('Poll error: ' + err.message);
+          uiLog('Poll/apply answer error: ' + err.message);
         }
       }, 2000);
     });

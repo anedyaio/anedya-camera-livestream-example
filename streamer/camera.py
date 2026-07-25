@@ -625,7 +625,7 @@ class CameraSource:
 
             elapsed = time.monotonic() - loop_start
             sleep_time = max(0.0, frame_interval - elapsed)
-            await asyncio.sleep(sleep_time)  # pace to target FPS
+            # await asyncio.sleep(sleep_time)  # pace to target FPS
 
     async def get_next_frame(
         self, last_known_sequence: int

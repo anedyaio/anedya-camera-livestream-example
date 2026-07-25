@@ -13,6 +13,7 @@ dependencies = [
     "paho-mqtt",
     "qrcode",
     "sounddevice",
+    "zstandard",
 ]
 
 [project.scripts]
