@@ -1,27 +1,32 @@
 """
 CameraStreamer — top-level coordinator for WebRTC signaling and media delivery.
 
+Supports two signaling methods selectable via SIGNALING_METHOD env var:
+
+  "commands"   — Anedya Commands (zstd-compressed SDP, lifecycle tracking)
+    Peer sends command "webrtc_offer"  (data = base64(zstd(offer JSON)))
+      → Anedya MQTT command event
+      → _handle_command()
+      → _handle_offer_commands()
+      → device publishes status "processing" with ack data = base64(zstd(answer SDP))
+      → Peer polls the command status, reads the answer, completes the handshake
+      → device concludes the command "success" / "failure" (terminal)
+
+  "valuestore" — Anedya Value Store (offer_<id> / answer_<id>)
+    Peer writes offer_<id>
+      → Anedya MQTT VS_UPDATES event
+      → _handle_valuestore_update()
+      → _handle_offer_valuestore()
+      → device writes answer_<id>
+      → Peer reads answer and completes the WebRTC handshake
+
 Responsibilities:
-  - Connect to the Anedya MQTT broker and subscribe to inbound command events.
-  - Detect incoming WebRTC offers sent as the ``webrtc_offer`` command.
-  - For each offer: create a peer connection, attach video and audio tracks, and
-    publish the answer as the command's ack data (status ``processing``).
-  - Handle DataChannel commands from each peer: ``timeline``, ``seek``, ``live``.
+  - Connect to the Anedya MQTT broker and subscribe to relevant topics.
+  - For each offer: create a peer connection, attach video and audio tracks,
+    and publish the answer.
+  - Handle DataChannel commands from each peer: timeline, seek, live.
   - Start the shared CameraSource and RecordingManager at process startup.
   - Gracefully clean up all peers, the camera, and MQTT on shutdown.
-
-Signaling path (Anedya Commands — same as the ESP-CAM project):
-  Peer sends command "webrtc_offer"  (data = base64(zstd(offer JSON)))
-    → Anedya MQTT command event
-    → _handle_command()
-    → _handle_offer()
-    → device publishes status "processing" with ack data = base64(zstd(answer SDP))
-    → Peer polls the command status, reads the answer, completes the handshake
-    → device concludes the command "success" / "failure" (terminal)
-
-The command id assigned by Anedya is the correlation key. The SDP is zstd-
-compressed with a shared trained dictionary (see _compress_signaling), which is
-what makes a full media SDP fit inside a command payload.
 """
 
 import asyncio
@@ -46,6 +51,8 @@ from config import (
     ANEDYA_CA_CERT,
     ANEDYA_CONNECTION_KEY,
     ANEDYA_DEVICE_ID,
+    CAMERA_SOURCE,
+    CAMERA_SOURCE_URL,
     HEARTBEAT_INTERVAL_SECONDS,
     MOTION_ANALYSIS_HEIGHT,
     MOTION_ANALYSIS_WIDTH,
@@ -55,15 +62,18 @@ from config import (
     MQTT_BROKER,
     MQTT_KEEPALIVE,
     MQTT_PORT,
+    RECORDING_MIN_FREE_MB,
     RECORDING_RETENTION_SECONDS,
     RECORDING_SEGMENT_SECONDS,
-    RECORDING_MIN_FREE_MB,
+    SIGNALING_METHOD,
     TOPIC_COMMANDS,
     TOPIC_COMMAND_STATUS,
     TOPIC_ERRORS,
     TOPIC_HEARTBEAT,
     TOPIC_LOGS,
     TOPIC_RESPONSES,
+    TOPIC_VALUESTORE_SET,
+    TOPIC_VALUESTORE_UPDATES,
 )
 from audio import MicrophoneSource
 from recording import RecordingManager
@@ -73,19 +83,26 @@ log = logging.getLogger("streamer")
 
 _LOG_MAX_CHARS = 1000
 
+# ── Signaling compression (Commands mode) ─────────────────────────
 # Shared zstd dictionary for compressing WebRTC signaling SDP payloads before
 # they go into the command payload. A trained dictionary holds the large boilerplate
 # that repeats in every SDP (codec menu, extmaps, rtcp-fb), so each payload only
 # carries its deltas. This file MUST be byte-identical to the dictionary embedded
 # in the browser/app peers, or decompression fails.
-_SIGNALING_DICT = zstd.ZstdCompressionDict(
-    Path(__file__).with_name("signaling_dict.bin").read_bytes()
+_SIGNALING_DICT_PATH = Path(__file__).with_name("signaling_dict.bin")
+_SIGNALING_DICT = (
+    zstd.ZstdCompressionDict(_SIGNALING_DICT_PATH.read_bytes())
+    if _SIGNALING_DICT_PATH.exists()
+    else None
 )
 _SIGNALING_ZSTD_LEVEL = 19
 
 
 def _compress_signaling(text: str) -> str:
     """zstd-compress (with the shared dict) then base64 a JSON signaling payload."""
+    assert _SIGNALING_DICT is not None, (
+        "signaling_dict.bin not found — required for Commands signaling mode"
+    )
     raw = zstd.ZstdCompressor(
         level=_SIGNALING_ZSTD_LEVEL, dict_data=_SIGNALING_DICT
     ).compress(text.encode("utf-8"))
@@ -94,6 +111,9 @@ def _compress_signaling(text: str) -> str:
 
 def _decompress_signaling(data: str) -> str:
     """Inverse of :func:`_compress_signaling`: base64-decode then zstd-decompress."""
+    assert _SIGNALING_DICT is not None, (
+        "signaling_dict.bin not found — required for Commands signaling mode"
+    )
     raw = base64.b64decode(data)
     return zstd.ZstdDecompressor(dict_data=_SIGNALING_DICT).decompress(raw).decode("utf-8")
 
@@ -175,15 +195,21 @@ class CameraStreamer:
     def __init__(
         self,
         camera_index: int,
+        source_mode: str = "usb",
+        source_url: str = "",
+        signaling_method: str = "commands",
         enable_audio: bool = True,
         record_path: str = "recordings",
         enable_motion_detection: bool = False,
     ):
         self.camera_index = camera_index
+        self.source_mode = source_mode
+        self.source_url = source_url
+        self.signaling_method = signaling_method
         self.enable_audio = enable_audio
         self.enable_motion_detection = enable_motion_detection
 
-        # command_id -> {"pc", "video", "audio", "concluded"}
+        # command_id / session_id -> {"pc", "video", "audio", "concluded"}
         self._active_peers: dict[str, dict] = {}
 
         self._event_loop: asyncio.AbstractEventLoop | None = None
@@ -224,12 +250,12 @@ class CameraStreamer:
                     )
                     if result.rc != mqtt_lib.MQTT_ERR_SUCCESS:
                         log.warning("Heartbeat publish failed rc=%s", result.rc)
-                    # else:
-                    #     log.debug("Heartbeat published")
                 except Exception as e:
                     log.warning("Heartbeat failed: %s", e)
 
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+    # ── MQTT connection ───────────────────────────────────────────
 
     def _connect_to_mqtt_broker(self) -> None:
         """Create, configure, and start the Paho MQTT client.
@@ -265,20 +291,23 @@ class CameraStreamer:
         )
 
         log.info("Connecting to Anedya MQTT broker %s:%d...", MQTT_BROKER, MQTT_PORT)
-        # connect_async() returns immediately; loop_start()'s background thread
-        # handles DNS resolution and the TCP/TLS handshake without blocking the
-        # asyncio event loop.
         client.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=MQTT_KEEPALIVE)
-        # loop_start() spins the MQTT network I/O in a daemon thread.
-        # All paho callbacks (_on_connect, _on_message, etc.) run in that thread,
-        # NOT in the asyncio event loop thread — keep that distinction in mind.
         client.loop_start()
         self._mqtt_client = client
 
     def _on_mqtt_connect(self, client, _userdata, _flags, rc) -> None:
         if rc == 0:
-            log.info("Connected to Anedya broker — subscribing to commands")
-            client.subscribe(TOPIC_COMMANDS)
+            log.info(
+                "Connected to Anedya broker — signaling mode: %s",
+                self.signaling_method.upper(),
+            )
+
+            # Subscribe based on signaling method
+            if self.signaling_method == "commands":
+                client.subscribe(TOPIC_COMMANDS)
+            else:
+                client.subscribe(TOPIC_VALUESTORE_UPDATES)
+
             client.subscribe(TOPIC_RESPONSES)
             client.subscribe(TOPIC_ERRORS)
 
@@ -321,20 +350,20 @@ class CameraStreamer:
 
         if message.topic == TOPIC_COMMANDS:
             self._handle_command(payload)
+        elif message.topic == TOPIC_VALUESTORE_UPDATES:
+            self._handle_valuestore_update(payload)
         elif message.topic == TOPIC_RESPONSES:
             if not payload.get("success", True):
                 log.warning("MQTT response error: %s", payload)
         elif message.topic == TOPIC_ERRORS:
             log.error("MQTT error: %s", payload)
 
+    # ══════════════════════════════════════════════════════════════
+    #  COMMANDS-BASED SIGNALING
+    # ══════════════════════════════════════════════════════════════
+
     def _handle_command(self, payload: dict) -> None:
         """Dispatch an async offer-handling coroutine when a webrtc_offer arrives.
-
-        Inbound command JSON::
-
-            {"commandId": "<uuid>", "command": "webrtc_offer",
-             "datatype": "string", "data": "<base64(zstd(offer JSON))>",
-             "exp": <int>}
 
         MQTT callbacks run in paho's background thread, so the coroutine is
         scheduled onto the asyncio event loop via run_coroutine_threadsafe.
@@ -348,26 +377,24 @@ class CameraStreamer:
             log.warning("webrtc_offer command missing commandId — ignoring")
             return
 
-        # Acknowledge receipt before doing any work (received -> processing -> ...).
+        # Acknowledge receipt before doing any work.
         self._publish_command_status(command_id, CMD_STATUS_RECEIVED)
 
-        # Offer data arrives as base64 either way; "binary" gives more headroom
-        # than "string" (1023 chars) because Anedya counts the decoded bytes.
         if payload.get("datatype") not in ("string", "binary"):
             log.error("webrtc_offer has unexpected datatype %r", payload.get("datatype"))
             self._publish_command_status(command_id, CMD_STATUS_FAILED, "bad datatype")
             return
 
-        log.info("Incoming WebRTC offer (cmd=%s)", command_id)
+        log.info("Incoming WebRTC offer [commands] (cmd=%s)", command_id)
         assert self._event_loop is not None
 
         future = asyncio.run_coroutine_threadsafe(
-            self._handle_offer(command_id, payload.get("data", "")),
+            self._handle_offer_commands(command_id, payload.get("data", "")),
             self._event_loop,
         )
         future.add_done_callback(
             lambda f: (
-                log.error("_handle_offer raised: %s", f.exception())
+                log.error("_handle_offer_commands raised: %s", f.exception())
                 if f.exception()
                 else None
             )
@@ -380,15 +407,7 @@ class CameraStreamer:
         ack_data: str | None = None,
         ack_data_type: str = "string",
     ) -> None:
-        """Publish a command status update over MQTT.
-
-        ``ack_data`` is the compressed answer SDP for ``processing`` (sent as
-        ``binary`` so Anedya counts the decoded bytes, not the 1023-char string
-        limit) or a short failure reason (``string``). ``received`` and terminal
-        ``success`` updates carry no ack data. ``ack_data`` is always a base64
-        string on the wire either way; the datatype only changes how Anedya
-        measures/stores it.
-        """
+        """Publish a command status update over MQTT."""
         assert self._mqtt_client is not None
         message: dict = {
             "reqId": "",
@@ -401,21 +420,9 @@ class CameraStreamer:
         self._mqtt_client.publish(TOPIC_COMMAND_STATUS, json.dumps(message), qos=1)
         log.debug("Command status=%s published (cmd=%s)", status, command_id)
 
-    async def _handle_offer(self, command_id: str, offer_data: str) -> None:
-        """Create a peer connection, attach tracks, and publish the WebRTC answer.
-
-        Steps:
-          1. Decompress + parse the offer SDP and TURN credentials from the
-             command's ``data`` field.
-          2. Build the ICE server list from the provided TURN credentials.
-          3. Create an RTCPeerConnection and attach video and audio tracks.
-          4. Register a DataChannel handler for seek / live / timeline commands.
-          5. Create and apply the local answer SDP.
-          6. Wait for ICE gathering to complete (15 s timeout).
-          7. Publish the compressed answer via a "processing" status update.
-        """
+    async def _handle_offer_commands(self, command_id: str, offer_data: str) -> None:
+        """Handle an offer via Commands signaling (zstd-compressed SDP)."""
         try:
-            # The peer sends the offer zstd-compressed (shared dict) + base64.
             data = json.loads(_decompress_signaling(offer_data))
             offer_sdp = data["offer"]
         except Exception as exc:
@@ -423,7 +430,7 @@ class CameraStreamer:
             self._publish_command_status(command_id, CMD_STATUS_FAILED, "malformed offer")
             return
 
-        log.info("Processing offer (cmd=%s)", command_id)
+        log.info("Processing offer [commands] (cmd=%s)", command_id)
 
         turn_data = data.get("turn")
         if not turn_data:
@@ -431,7 +438,6 @@ class CameraStreamer:
             self._publish_command_status(command_id, CMD_STATUS_FAILED, "no turn creds")
             return
 
-        # Build the ICE server list from the offer data
         try:
             ice_servers = build_turn_ice_servers(
                 turn_data["endpoint"],
@@ -443,39 +449,18 @@ class CameraStreamer:
             self._publish_command_status(command_id, CMD_STATUS_FAILED, "bad turn creds")
             return
 
-        # Check if the camera source is ready
         if self.source is None:
-            log.error(
-                "Camera source not ready — cannot handle offer (cmd=%s)", command_id
-            )
+            log.error("Camera source not ready — cannot handle offer (cmd=%s)", command_id)
             self._publish_command_status(command_id, CMD_STATUS_FAILED, "camera not ready")
             return
 
-        # Each command id is a distinct session; a duplicate means a retry, so
-        # close the stale connection before rebuilding it.
         if command_id in self._active_peers:
-            log.warning(
-                "Command %s already active — closing stale connection", command_id
-            )
+            log.warning("Command %s already active — closing stale connection", command_id)
             await self._close_peer_session(command_id)
 
-        # Create the peer connection
-        peer_connection = RTCPeerConnection(
-            configuration=RTCConfiguration(iceServers=ice_servers)
-        )
+        # Create peer connection + tracks
+        peer_connection, video_track, audio_track = self._create_peer(ice_servers)
 
-        # Create video + audio tracks for THIS viewer
-        video_track = WebcamTrack(self.source, self.recorder)
-        # DvrAudioTrack` gets a reference to `video_track`. Audio never decides its own mode — 
-        # it just reads `video_track.mode` every frame and follows it. Video is the authority.
-        audio_track = (
-            DvrAudioTrack(self.audio_source, video_track)
-            if self.enable_audio and self.audio_source
-            else None
-        )
-
-        # Store and attach tracks to connection. ``concluded`` guards the terminal
-        # command status so success/failure is reported to the peer only once.
         self._active_peers[command_id] = {
             "pc": peer_connection,
             "video": video_track,
@@ -487,29 +472,211 @@ class CameraStreamer:
             peer_connection.addTrack(audio_track)
 
         # Register event handlers
+        self._setup_data_channel_handler(peer_connection, video_track, command_id)
+
+        @peer_connection.on("connectionstatechange")
+        async def on_connection_state_change():
+            state = peer_connection.connectionState
+            log.info("Peer connection state: %s (cmd=%s)", state, command_id)
+            if state == "connected":
+                self._conclude_command(command_id, True)
+            elif state in ("failed", "closed"):
+                self._conclude_command(command_id, False, "connection failed")
+                await self._close_peer_session(command_id)
+
+        # SDP handshake
+        await peer_connection.setRemoteDescription(
+            RTCSessionDescription(sdp=offer_sdp["sdp"], type=offer_sdp["type"])
+        )
+        answer = await peer_connection.createAnswer()
+        await peer_connection.setLocalDescription(answer)
+
+        # Wait for ICE gathering
+        await self._wait_for_ice_gathering(peer_connection, command_id)
+
+        # Publish answer via command status (zstd-compressed)
+        answer_payload = json.dumps({
+            "sdp": peer_connection.localDescription.sdp,
+            "type": peer_connection.localDescription.type,
+        })
+        ack_data = _compress_signaling(answer_payload)
+        log.debug("Answer sizes (cmd=%s): b64 ack=%dB", command_id, len(ack_data))
+        self._publish_command_status(
+            command_id, CMD_STATUS_PROCESSING, ack_data, ack_data_type="binary"
+        )
+        log.info("Answer published via command status (cmd=%s)", command_id)
+
+    def _conclude_command(self, command_id: str, success: bool, reason: str = "") -> None:
+        """Send the terminal command status (success/failure) at most once."""
+        peer = self._active_peers.get(command_id)
+        if peer is None or peer.get("concluded"):
+            return
+        peer["concluded"] = True
+        if success:
+            self._publish_command_status(command_id, CMD_STATUS_SUCCESS)
+        else:
+            self._publish_command_status(command_id, CMD_STATUS_FAILED, reason or None)
+
+    # ══════════════════════════════════════════════════════════════
+    #  VALUE-STORE-BASED SIGNALING
+    # ══════════════════════════════════════════════════════════════
+
+    def _handle_valuestore_update(self, payload: dict) -> None:
+        """Dispatch an async offer-handling coroutine when an offer key arrives."""
+        log.debug("Value-store update: %s", payload)
+        key = payload.get("key", "")
+        if not key.startswith("offer_"):
+            log.info("Value-store update ignored (key=%r)", key)
+            return
+
+        session_id = key[len("offer_"):]
+        log.info("Incoming WebRTC offer [valuestore] (session=%s)", session_id)
+        assert self._event_loop is not None
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._handle_offer_valuestore(session_id, payload.get("value", "")),
+            self._event_loop,
+        )
+        future.add_done_callback(
+            lambda f: (
+                log.error("_handle_offer_valuestore raised: %s", f.exception())
+                if f.exception()
+                else None
+            )
+        )
+
+    def _write_to_valuestore(self, key: str, value: str) -> None:
+        """Publish a string value to the Anedya value store over MQTT."""
+        assert self._mqtt_client is not None
+        message = json.dumps({
+            "reqId": "",
+            "key":   key,
+            "value": value,
+            "type":  "string",
+        })
+        self._mqtt_client.publish(TOPIC_VALUESTORE_SET, message, qos=1)
+        log.debug("Value-store write: key=%s", key)
+
+    async def _handle_offer_valuestore(self, session_id: str, raw_value: str) -> None:
+        """Handle an offer via Value Store signaling (plain JSON)."""
+        try:
+            data = json.loads(raw_value)
+            offer_sdp = data["offer"]
+        except Exception as exc:
+            log.error("Malformed offer payload (session=%s): %s", session_id, exc)
+            return
+
+        log.info("Processing offer [valuestore] (session=%s)", session_id)
+
+        turn_data = data.get("turn")
+        if not turn_data:
+            log.error("No TURN credentials in offer (session=%s)", session_id)
+            return
+
+        try:
+            ice_servers = build_turn_ice_servers(
+                turn_data["endpoint"],
+                turn_data["username"],
+                turn_data["credential"],
+            )
+        except (KeyError, ValueError) as exc:
+            log.error("Invalid TURN data in offer (session=%s): %s", session_id, exc)
+            return
+
+        if self.source is None:
+            log.error("Camera source not ready — cannot handle offer (session=%s)", session_id)
+            return
+
+        if session_id in self._active_peers:
+            log.warning("Session %s already active — closing stale connection", session_id)
+            await self._close_peer_session(session_id)
+
+        # Create peer connection + tracks
+        peer_connection, video_track, audio_track = self._create_peer(ice_servers)
+
+        self._active_peers[session_id] = {
+            "pc": peer_connection,
+            "video": video_track,
+            "audio": audio_track,
+            "concluded": False,
+        }
+        peer_connection.addTrack(video_track)
+        if audio_track:
+            peer_connection.addTrack(audio_track)
+
+        # Register event handlers
+        self._setup_data_channel_handler(peer_connection, video_track, session_id)
+
+        @peer_connection.on("connectionstatechange")
+        async def on_connection_state_change():
+            state = peer_connection.connectionState
+            log.info("Peer connection state: %s (session=%s)", state, session_id)
+            if state in ("failed", "closed"):
+                await self._close_peer_session(session_id)
+
+        # SDP handshake
+        await peer_connection.setRemoteDescription(
+            RTCSessionDescription(sdp=offer_sdp["sdp"], type=offer_sdp["type"])
+        )
+        answer = await peer_connection.createAnswer()
+        await peer_connection.setLocalDescription(answer)
+
+        # Wait for ICE gathering
+        await self._wait_for_ice_gathering(peer_connection, session_id)
+
+        # Publish answer via value store (plain JSON)
+        answer_payload = json.dumps({
+            "sdp":  peer_connection.localDescription.sdp,
+            "type": peer_connection.localDescription.type,
+        })
+        self._write_to_valuestore(f"answer_{session_id}", answer_payload)
+        log.info("Answer published to value store (session=%s)", session_id)
+
+    # ══════════════════════════════════════════════════════════════
+    #  SHARED HELPERS
+    # ══════════════════════════════════════════════════════════════
+
+    def _create_peer(
+        self, ice_servers: list[RTCIceServer]
+    ) -> tuple[RTCPeerConnection, WebcamTrack, DvrAudioTrack | None]:
+        """Create a peer connection with video and optional audio tracks."""
+        assert self.source is not None
+        peer_connection = RTCPeerConnection(
+            configuration=RTCConfiguration(iceServers=ice_servers)
+        )
+        video_track = WebcamTrack(self.source, self.recorder)
+        audio_track = (
+            DvrAudioTrack(self.audio_source, video_track)
+            if self.enable_audio and self.audio_source
+            else None
+        )
+        return peer_connection, video_track, audio_track
+
+    def _setup_data_channel_handler(
+        self,
+        peer_connection: RTCPeerConnection,
+        video_track: WebcamTrack,
+        peer_id: str,
+    ) -> None:
+        """Register the DataChannel handler for timeline/seek/live commands."""
+
         @peer_connection.on("datachannel")
         def on_data_channel(channel):
-            log.info(
-                "DataChannel opened (cmd=%s, label=%s)", command_id, channel.label
-            )
+            log.info("DataChannel opened (peer=%s, label=%s)", peer_id, channel.label)
             command_lock = asyncio.Lock()
 
             def push_timeline_to_peer() -> None:
                 timeline = self.recorder.get_timeline()
                 playback_offset = video_track.current_playback_offset()
-                # In live mode report the slider at the far-right (end of recording).
-                # The peer UI uses this to position the scrubber at "now".
                 if video_track.mode == "live":
                     playback_offset = timeline["duration"]
                 channel.send(
-                    json.dumps(
-                        {
-                            "type": "timeline",
-                            "mode": video_track.mode,
-                            "playback_offset": playback_offset,
-                            **timeline,
-                        }
-                    )
+                    json.dumps({
+                        "type": "timeline",
+                        "mode": video_track.mode,
+                        "playback_offset": playback_offset,
+                        **timeline,
+                    })
                 )
 
             @channel.on("message")
@@ -533,12 +700,10 @@ class CameraStreamer:
                                 push_timeline_to_peer()
                             else:
                                 channel.send(
-                                    json.dumps(
-                                        {
-                                            "type": "error",
-                                            "message": "No recording available at selected time",
-                                        }
-                                    )
+                                    json.dumps({
+                                        "type": "error",
+                                        "message": "No recording available at selected time",
+                                    })
                                 )
                         elif action == "live":
                             await video_track.go_live()
@@ -546,35 +711,12 @@ class CameraStreamer:
                     except Exception:
                         log.exception("DataChannel command failed")
 
-            # Send the current timeline immediately so the peer UI can render
-            # the scrubber without waiting for the first user interaction.
             push_timeline_to_peer()
 
-        @peer_connection.on("connectionstatechange")
-        async def on_connection_state_change():
-            state = peer_connection.connectionState
-            log.info("Peer connection state: %s (cmd=%s)", state, command_id)
-            # Conclude the command with a terminal status the first time the
-            # connection resolves. success/failure are terminal in Anedya, so the
-            # peer stops polling once we report one.
-            if state == "connected":
-                self._conclude_command(command_id, True)
-            elif state in ("failed", "closed"):
-                self._conclude_command(command_id, False, "connection failed")
-                await self._close_peer_session(command_id)
-
-        # SDP handshake.
-        # SDP = Session Description Protocol.
-        # A text blob that describes "I can send H.264 video, Opus audio, here are my network candidates."
-        await peer_connection.setRemoteDescription(
-            RTCSessionDescription(sdp=offer_sdp["sdp"], type=offer_sdp["type"])
-        )
-        answer = await peer_connection.createAnswer()
-        await peer_connection.setLocalDescription(answer)
-
-        # Wait until ICE gathering is complete before publishing the answer.
-        # Publishing early would result in an SDP without TURN relay candidates,
-        # which breaks connectivity when both peers are behind NAT.
+    async def _wait_for_ice_gathering(
+        self, peer_connection: RTCPeerConnection, peer_id: str
+    ) -> None:
+        """Wait until ICE gathering is complete (15s timeout)."""
         ice_gathering_done = asyncio.Event()
 
         @peer_connection.on("icegatheringstatechange")
@@ -587,47 +729,13 @@ class CameraStreamer:
                 await asyncio.wait_for(ice_gathering_done.wait(), timeout=15)
             except asyncio.TimeoutError:
                 log.warning(
-                    "ICE gathering timed out (cmd=%s) — proceeding with available candidates",
-                    command_id,
+                    "ICE gathering timed out (peer=%s) — proceeding with available candidates",
+                    peer_id,
                 )
 
-        # Publish the answer as the command's ack data with status "processing",
-        # zstd-compressed (shared dict) + base64 to fit the command payload budget.
-        # success/failure are sent later, once the connection actually resolves.
-        answer_payload = json.dumps(
-            {
-                "sdp": peer_connection.localDescription.sdp,
-                "type": peer_connection.localDescription.type,
-            }
-        )
-        ack_data = _compress_signaling(answer_payload)
-        log.debug("Answer sizes (cmd=%s): b64 ack=%dB", command_id, len(ack_data))
-        # Send as "binary": the ~1.1 KB base64 exceeds the 1023-char "string"
-        # cap, but its decoded byte count is well under, and Anedya measures
-        # binary by decoded bytes.
-        self._publish_command_status(
-            command_id, CMD_STATUS_PROCESSING, ack_data, ack_data_type="binary"
-        )
-        log.info("Answer published via command status (cmd=%s)", command_id)
-
-    def _conclude_command(self, command_id: str, success: bool, reason: str = "") -> None:
-        """Send the terminal command status (success/failure) at most once.
-
-        Guarded by the peer's ``concluded`` flag so a later state change (e.g.
-        connected -> closed on teardown) does not re-conclude a terminal command.
-        """
-        peer = self._active_peers.get(command_id)
-        if peer is None or peer.get("concluded"):
-            return
-        peer["concluded"] = True
-        if success:
-            self._publish_command_status(command_id, CMD_STATUS_SUCCESS)
-        else:
-            self._publish_command_status(command_id, CMD_STATUS_FAILED, reason or None)
-
-    async def _close_peer_session(self, command_id: str) -> None:
+    async def _close_peer_session(self, peer_id: str) -> None:
         """Release all resources owned by one viewer session."""
-        peer = self._active_peers.pop(command_id, None)
+        peer = self._active_peers.pop(peer_id, None)
         if not peer:
             return
 
@@ -635,7 +743,9 @@ class CameraStreamer:
         if peer["audio"]:
             peer["audio"].release()
         await peer["pc"].close()
-        log.info("Peer session closed (cmd=%s)", command_id)
+        log.info("Peer session closed (peer=%s)", peer_id)
+
+    # ── Main run loop ─────────────────────────────────────────────
 
     async def run(self) -> None:
         """Start all subsystems and block until a shutdown signal is received."""
@@ -650,14 +760,14 @@ class CameraStreamer:
         # the very first frames are not dropped while the queue is being created.
         self._recorder_task = asyncio.create_task(self.recorder.run())
         self._recorder_task.add_done_callback(self._on_recorder_done)
-        await (
-            self.recorder.wait_until_ready()
-        )  # camera can't start before recorder is ready
+        await self.recorder.wait_until_ready()
 
-        # Create the camera source
+        # Create the camera source with the configured backend
         source = CameraSource(
             self.camera_index,
             self.recorder,
+            source_mode=self.source_mode,
+            source_url=self.source_url,
             analysis_width=MOTION_ANALYSIS_WIDTH,
             analysis_height=MOTION_ANALYSIS_HEIGHT,
             enable_motion_detection=self.enable_motion_detection,
@@ -665,7 +775,7 @@ class CameraStreamer:
             motion_cooldown=float(MOTION_COOLDOWN_SECONDS),
             motion_roi_top_fraction=MOTION_ROI_TOP_FRACTION,
         )
-        await source.start()  # start the camera source capture loop in background
+        await source.start()
 
         # Create and start audio source if enabled
         if self.enable_audio:
@@ -678,7 +788,11 @@ class CameraStreamer:
                 log.warning("Audio disabled: %s", exc)
 
         self.source = source
-        log.info("Streamer running — recording started, waiting for peers")
+        log.info(
+            "Streamer running — camera=%s, signaling=%s, recording started, waiting for peers",
+            self.source_mode.upper(),
+            self.signaling_method.upper(),
+        )
 
         # Main loop: wait for peers to connect and handle them
         try:
@@ -689,8 +803,8 @@ class CameraStreamer:
 
     async def shutdown(self) -> None:
         """Gracefully close all peers, the camera, the recorder, and MQTT."""
-        for command_id in list(self._active_peers):
-            await self._close_peer_session(command_id)
+        for peer_id in list(self._active_peers):
+            await self._close_peer_session(peer_id)
 
         if self.source:
             await self.source.stop()

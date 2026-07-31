@@ -1,7 +1,7 @@
 """
 Camera capture pipeline shared across all viewer sessions.
 
-CameraSource opens the webcam once and runs a continuous capture loop.
+CameraSource opens a camera once and runs a continuous capture loop.
 It feeds frames to two consumers simultaneously:
   1. RecordingManager — for writing rolling MP4 segments to disk.
   2. WebcamTrack instances — one per active viewer, for live streaming.
@@ -9,10 +9,9 @@ It feeds frames to two consumers simultaneously:
 Frames are shared via an asyncio.Condition so multiple tracks can wait
 for the next frame without blocking the capture loop.
 
-OpenCV is used only for motion detection and overlays. PyAV owns camera
-capture, while best-available mode selection is preserved.
-
-
+Supports two capture backends selected via CAMERA_SOURCE:
+  "usb"  — PyAV direct V4L2/DShow capture (high performance, codec negotiation)
+  "rtsp" — OpenCV cv2.VideoCapture with FFmpeg backend (RTSP/IP cameras)
 """
 
 import asyncio
@@ -315,6 +314,57 @@ def _stream_fps(stream) -> float | None:
     return None
 
 
+def configure_camera_max_resolution(
+    cap: cv2.VideoCapture,
+    target_fps: float,
+    camera_index: int | None = None,
+) -> tuple[int, int, float]:
+    """Select the highest camera mode for OpenCV, falling back to probing.
+
+    Used by the RTSP path when the source is a local camera (fallback).
+    """
+    mode = (
+        discover_best_camera_mode(camera_index, target_fps)
+        if camera_index is not None
+        else None
+    )
+    if mode:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, mode.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, mode.height)
+        cap.set(cv2.CAP_PROP_FPS, mode.fps)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*mode.fourcc))
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or mode.width)
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or mode.height)
+        actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or mode.fps)
+        return actual_width, actual_height, actual_fps
+
+    best_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 0)
+    best_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    best_area   = best_width * best_height
+
+    cap.set(cv2.CAP_PROP_FPS, target_fps)
+
+    for requested_width, requested_height in CAPTURE_RESOLUTION_CANDIDATES:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH,  requested_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, requested_height)
+
+        actual_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)  or 0)
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        actual_area   = actual_width * actual_height
+
+        if actual_area > best_area:
+            best_width  = actual_width
+            best_height = actual_height
+            best_area   = actual_area
+
+        if actual_width >= requested_width and actual_height >= requested_height:
+            best_width  = actual_width
+            best_height = actual_height
+            break
+
+    actual_fps = float(cap.get(cv2.CAP_PROP_FPS) or target_fps)
+    return best_width, best_height, actual_fps
+
 
 def draw_status_overlay(
     frame: np.ndarray,
@@ -388,6 +438,10 @@ def draw_status_overlay(
 class CameraSource:
     """Always-on camera pipeline shared by all viewer peers.
 
+    Supports two capture backends:
+      - "usb"  — PyAV direct V4L2/DShow capture
+      - "rtsp" — OpenCV cv2.VideoCapture (RTSP URL or local fallback)
+
     Responsibilities:
     - Open the camera device once at startup.
     - Capture frames continuously in a background asyncio task.
@@ -402,6 +456,8 @@ class CameraSource:
         self,
         camera_index: int,
         recorder: RecordingManager,
+        source_mode: str = "usb",
+        source_url: str = "",
         analysis_width: int = MOTION_ANALYSIS_WIDTH,
         analysis_height: int = MOTION_ANALYSIS_HEIGHT,
         fps: float = 60.0,
@@ -411,6 +467,8 @@ class CameraSource:
         motion_roi_top_fraction: float = 0.5,
     ):
         self.camera_index = camera_index
+        self.source_mode = source_mode.strip().lower()
+        self.source_url = source_url.strip()
         self.recorder = recorder
         self.analysis_width = analysis_width
         self.analysis_height = analysis_height
@@ -421,17 +479,22 @@ class CameraSource:
         # Clamp to [0.0, 0.95] — 0.95 leaves at least 5% of frame for analysis.
         self._motion_roi_top_fraction = max(0.0, min(0.95, motion_roi_top_fraction))
 
-        self._av_container, selected_mode = open_best_pyav_camera(camera_index, fps)
-        self._av_decoder = self._av_container.decode(video=0)
-        self.capture_width = selected_mode.width
-        self.capture_height = selected_mode.height
-        self.capture_fps = selected_mode.fps
+        # ── Backend-specific initialisation ──
+        self._av_container = None
+        self._av_decoder = None
+        self._cv_cap = None
+
+        if self.source_mode == "rtsp":
+            self._init_rtsp_capture()
+        else:
+            self._init_usb_capture()
+
         if self.capture_fps > 0:
             self.fps = self.capture_fps
             self.recorder.fps = self.capture_fps
         log.info(
-            "Camera %d selected: %dx%d @ %.1f fps",
-            camera_index,
+            "Camera source opened [%s]: %dx%d @ %.1f fps",
+            self.source_mode.upper(),
             self.capture_width,
             self.capture_height,
             self.capture_fps,
@@ -439,9 +502,6 @@ class CameraSource:
 
         # detectShadows=False improves performance and avoids shadows being
         # classified as foreground, which would cause false motion events.
-        # MOG2 = Mixture of Gaussians 2. Learns what "background" looks like over time.
-        # Anything that doesn't match the learned background = foreground = potential motion.
-        # `detectShadows=False` = shadows are treated as background (otherwise shadows trigger false motion alerts).
         self._background_subtractor = (
             cv2.createBackgroundSubtractorMOG2(detectShadows=False)
             if self.enable_motion_detection
@@ -466,13 +526,59 @@ class CameraSource:
         self._is_running = False
         self._capture_task: asyncio.Task | None = None
 
+    # ── USB capture init (PyAV) ───────────────────────────────────
+
+    def _init_usb_capture(self) -> None:
+        """Open the camera using PyAV for direct V4L2/DShow capture."""
+        self._av_container, selected_mode = open_best_pyav_camera(
+            self.camera_index, self.fps
+        )
+        self._av_decoder = self._av_container.decode(video=0)
+        self.capture_width = selected_mode.width
+        self.capture_height = selected_mode.height
+        self.capture_fps = selected_mode.fps
+
+    # ── RTSP capture init (OpenCV) ────────────────────────────────
+
+    def _init_rtsp_capture(self) -> None:
+        """Open the camera using OpenCV VideoCapture for RTSP streams."""
+        if self.source_url:
+            self._cv_cap = cv2.VideoCapture(self.source_url, cv2.CAP_FFMPEG)
+            self._source_label = self.source_url
+        else:
+            system = platform.system()
+            backend = cv2.CAP_DSHOW if system == "Windows" else cv2.CAP_V4L2
+            self._cv_cap = cv2.VideoCapture(self.camera_index, backend)
+            self._cv_cap.set(
+                cv2.CAP_PROP_FOURCC,
+                cv2.VideoWriter_fourcc(*"MJPG"),
+            )
+            self._source_label = f"camera index {self.camera_index}"
+        self._cv_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not self._cv_cap.isOpened():
+            raise RuntimeError(f"Cannot open camera source {self._source_label}")
+
+        if self.source_url:
+            self.capture_width = int(self._cv_cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+            self.capture_height = int(self._cv_cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+            self.capture_fps = float(self._cv_cap.get(cv2.CAP_PROP_FPS) or self.fps)
+        else:
+            self.capture_width, self.capture_height, self.capture_fps = (
+                configure_camera_max_resolution(
+                    self._cv_cap, self.fps, self.camera_index
+                )
+            )
+
+    # ── Lifecycle ─────────────────────────────────────────────────
+
     async def start(self) -> None:
         """Start the background capture loop."""
         if self._capture_task is None:
             self._is_running = True
             self._capture_task = asyncio.create_task(self._capture_loop())
             self._capture_task.add_done_callback(self._on_capture_done)
-            log.info("Camera capture task started")
+            log.info("Camera capture task started [%s]", self.source_mode.upper())
 
     def _on_capture_done(self, task: asyncio.Task) -> None:
         """Log camera capture exits so heartbeat cannot hide a dead camera."""
@@ -487,6 +593,8 @@ class CameraSource:
         else:
             if was_running:
                 log.error("Camera capture task stopped unexpectedly")
+
+    # ── Frame processing (shared by both backends) ────────────────
 
     def _process_raw_frame(self, raw_frame: np.ndarray) -> tuple[np.ndarray, float]:
         """Motion detection + annotation. Runs in a thread via asyncio.to_thread."""
@@ -562,6 +670,8 @@ class CameraSource:
             self._fps_window_started_at = now
             self._fps_window_frames = 0
 
+    # ── USB frame reading (PyAV) ──────────────────────────────────
+
     def _read_pyav_frame(self) -> np.ndarray | None:
         try:
             frame = next(self._av_decoder)
@@ -583,13 +693,30 @@ class CameraSource:
             self._actual_frame_shape_logged = True
         return raw_frame
 
+    # ── RTSP frame reading (OpenCV) ───────────────────────────────
+
+    def _read_opencv_frame(self) -> np.ndarray | None:
+        assert self._cv_cap is not None
+        ret, frame = self._cv_cap.read()
+        if not ret:
+            return None
+        return frame
+
+    # ── Capture loop (dispatches to the right reader) ─────────────
+
     async def _capture_loop(self) -> None:
         """Main capture loop: read → analyse → annotate → record → publish."""
         frame_interval = 1 / self.fps if self.fps > 0 else 0
 
+        # Pick the right frame reader based on source mode
+        if self.source_mode == "rtsp":
+            read_frame = self._read_opencv_frame
+        else:
+            read_frame = self._read_pyav_frame
+
         while self._is_running:
             loop_start = time.monotonic()
-            raw_frame = await asyncio.to_thread(self._read_pyav_frame)
+            raw_frame = await asyncio.to_thread(read_frame)
             if raw_frame is None:
                 now_monotonic = time.monotonic()
                 seconds_without_frames = now_monotonic - self._last_frame_monotonic
@@ -657,5 +784,11 @@ class CameraSource:
             except Exception:
                 log.exception("Camera capture task failed during shutdown")
             self._capture_task = None
-        self._av_container.close()
-        log.info("Camera %d released", self.camera_index)
+
+        # Release the right backend
+        if self._av_container is not None:
+            self._av_container.close()
+            log.info("Camera %d released [USB/PyAV]", self.camera_index)
+        if self._cv_cap is not None and self._cv_cap.isOpened():
+            self._cv_cap.release()
+            log.info("Camera source released [RTSP/OpenCV]: %s", getattr(self, '_source_label', ''))

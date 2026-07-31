@@ -1,7 +1,7 @@
 [project]
 name = "streamer"
 version = "0.1.0"
-description = "Pi camera WebRTC streamer with Anedya MQTT signaling and rolling local recording."
+description = "Unified camera WebRTC streamer (USB + RTSP) with Anedya MQTT signaling and rolling local recording."
 requires-python = ">=3.11"
 dependencies = [
     "aiortc",
@@ -11,8 +11,8 @@ dependencies = [
     "numpy",
     "opencv-python",
     "paho-mqtt",
-    "qrcode",
     "sounddevice",
+    "zstandard",
 ]
 
 [project.scripts]
@@ -23,7 +23,7 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["main", "camera", "camera_streamer", "config", "recording", "tracks"]
+py-modules = ["main", "audio", "camera", "camera_streamer", "config", "recording", "tracks"]
 
 [dependency-groups]
 dev = [
