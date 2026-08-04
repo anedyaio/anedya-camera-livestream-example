@@ -14,11 +14,12 @@ Turn a Raspberry Pi into a CCTV-style camera system using Anedya for signaling a
 ## ✨ Features
 
 - **Live WebRTC video streaming :** low-latency peer-to-peer video using Anedya-managed STUN/TURN
+- **USB & RTSP Camera Support :** connect direct USB/CSI cameras or RTSP IP camera streams
 - **Local Recording :** continuous MP4 segments written to disk on the Pi
 - **Playback :** scrub through past footage from the viewer without any server-side transcoding
 - **Automatic max camera mode :** selects the highest usable camera capability for both live streaming and local recording
 - **Motion detection overlay :** bounding boxes drawn on detected motion regions in real time, with configurable ROI
-- **Microphone audio :** capture and stream Pi microphone audio alongside video
+- **Microphone audio :** capture and stream Pi microphone audio alongside video (graceful fallback if audio hardware is absent)
 - **Web viewer :** browser-based viewer, no install required
 - **Mobile viewer :** Flutter app for Android and iOS
 
@@ -89,14 +90,13 @@ If no recording is available at the requested playback position (gap in footage 
 │       ├── main.dart
 │       ├── peer_cam_screen.dart
 │       └── qr_code_scanner.dart
-└── streamer/               — Pi device app (Python)
-    ├── config.py           — credentials, constants, logging
-    ├── recording.py        — rolling MP4 segment writer
-    ├── camera.py           — capture loop, motion detection, timestamp overlay
-    ├── audio.py            — microphone capture with per-peer fan-out queues
-    ├── tracks.py           — WebRTC video and audio tracks
-    ├── camera_streamer.py  — MQTT signaling, peer connection handling
-    └── main.py             — CLI entrypoint
+├── config.py               — credentials, constants, logging
+├── recording.py            — rolling MP4 segment writer
+├── camera.py               — capture loop (USB + RTSP), motion detection, timestamp overlay
+├── audio.py                — microphone capture with per-peer fan-out queues
+├── tracks.py               — WebRTC video and audio tracks
+├── camera_streamer.py      — MQTT signaling, peer connection handling
+└── main.py                 — CLI entrypoint
 ```
 
 ---
@@ -107,7 +107,7 @@ If no recording is available at the requested playback position (gap in footage 
 
 **Hardware**
 - Raspberry Pi with network access (any model with USB or CSI camera support)
-- USB/UVC webcam (recommended) or CSI camera module
+- USB/UVC webcam, CSI camera module, or an RTSP IP camera
 - Optional: USB microphone for audio
 
 **Software / Accounts**
@@ -154,19 +154,24 @@ cd anedya-camera-livestream-example
 Create the local credentials file from the example:
 
 ```bash
-cp streamer/.env.example streamer/.env
+cp .env.example .env
 ```
 
-Edit `streamer/.env` and fill in your values:
+Edit `.env` and fill in your values:
 
 ```env
+# Camera source
+CAMERA_SOURCE=usb
+CAMERA_SOURCE_URL=          # Required when CAMERA_SOURCE=rtsp
+
+# Anedya credentials
 ANEDYA_DEVICE_ID=your-device-uuid
-ANEDYA_NODE_ID=your-node-uuid
 ANEDYA_CONNECTION_KEY=your-connection-key
 ANEDYA_REGION=ap-in-1
 
 # Recording
 RECORDING_SEGMENT_SECONDS=5
+RECORDING_MIN_FREE_MB=512
 RECORDING_RETENTION_DAYS=1
 RECORDING_RETENTION_HOURS=0
 RECORDING_RETENTION_SECONDS=
@@ -183,7 +188,10 @@ MOTION_ROI_TOP_FRACTION=0.5
 
 | Variable | Default | Description |
 |---|---|---|
-| `RECORDING_SEGMENT_SECONDS` | `5` | Duration of each MP4 segment |
+| `CAMERA_SOURCE` | `"usb"` | Camera capture backend: `"usb"` (direct camera) or `"rtsp"` (IP camera) |
+| `CAMERA_SOURCE_URL` | `""` | RTSP stream URL (required when `CAMERA_SOURCE=rtsp`) |
+| `RECORDING_SEGMENT_SECONDS` | `5` | Duration of each MP4 segment in seconds |
+| `RECORDING_MIN_FREE_MB` | `512` | Minimum free disk space required before recording pauses |
 | `RECORDING_RETENTION_DAYS` | `1` | How many days of footage to keep |
 | `RECORDING_RETENTION_HOURS` | `0` | Additional hours (stacks with days) |
 | `RECORDING_RETENTION_SECONDS` | *(computed)* | Override total retention in seconds |
@@ -202,7 +210,6 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install Python dependencies:
 
 ```bash
-cd streamer
 uv sync
 ```
 
@@ -317,6 +324,7 @@ This project uses OpenCV `VideoCapture`.
 
 ---
 
-## License
+## 📑 Looking for other examples
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+#### @ [Anedya Camera Livestream with ESP32](https://github.com/anedyaio/anedya-camera-livestream-example-esp32)
+
