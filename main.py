@@ -1,12 +1,11 @@
 """
 Unified camera streamer — entrypoint.
 
-Supports both USB and RTSP camera sources, and both Commands and Value Store
-signaling methods. Selection is done via environment variables (or .env file):
+Supports both USB and RTSP camera sources with Anedya Commands signaling.
+Selection is done via environment variables (or .env file):
 
     CAMERA_SOURCE      "usb" or "rtsp"       (default: usb)
     CAMERA_SOURCE_URL  RTSP URL              (required when CAMERA_SOURCE=rtsp)
-    SIGNALING_METHOD   "commands" or "valuestore"  (default: commands)
 
 Usage:
     uv run streamer                        # USB camera, commands signaling
@@ -28,7 +27,6 @@ from camera_streamer import CameraStreamer
 from config import (
     CAMERA_SOURCE,
     CAMERA_SOURCE_URL,
-    SIGNALING_METHOD,
     validate_anedya_config,
 )
 
@@ -39,7 +37,6 @@ async def main(
     camera_index: int,
     source_mode: str,
     source_url: str,
-    signaling_method: str,
     enable_audio: bool,
     enable_motion_detection: bool = False,
     record_path: str = "recordings",
@@ -49,7 +46,6 @@ async def main(
         camera_index,
         source_mode=source_mode,
         source_url=source_url,
-        signaling_method=signaling_method,
         enable_audio=enable_audio,
         record_path=record_path,
         enable_motion_detection=enable_motion_detection,
@@ -65,7 +61,7 @@ async def main(
 def cli() -> None:
     """Synchronous console entrypoint invoked by ``uv run streamer``."""
     parser = argparse.ArgumentParser(
-        description="Unified WebRTC streamer (USB + RTSP, Commands + ValueStore)"
+        description="Unified WebRTC streamer (USB + RTSP, Commands Signaling)"
     )
     parser.add_argument(
         "--camera",
@@ -91,9 +87,8 @@ def cli() -> None:
     args = parser.parse_args()
 
     log.info(
-        "Starting streamer (source=%s, signaling=%s, camera=%d, audio=%s, motion=%s, record-path=%s)",
+        "Starting streamer (source=%s, signaling=COMMANDS, camera=%d, audio=%s, motion=%s, record-path=%s)",
         CAMERA_SOURCE.upper(),
-        SIGNALING_METHOD.upper(),
         args.camera,
         "off" if args.no_audio else "on",
         "on" if args.motion_detection else "off",
@@ -107,7 +102,6 @@ def cli() -> None:
             args.camera,
             source_mode=CAMERA_SOURCE,
             source_url=CAMERA_SOURCE_URL,
-            signaling_method=SIGNALING_METHOD,
             enable_audio=not args.no_audio,
             enable_motion_detection=args.motion_detection,
             record_path=args.record_path,

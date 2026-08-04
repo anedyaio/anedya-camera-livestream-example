@@ -1,24 +1,14 @@
 """
 CameraStreamer — top-level coordinator for WebRTC signaling and media delivery.
 
-Supports two signaling methods selectable via SIGNALING_METHOD env var:
-
-  "commands"   — Anedya Commands (zstd-compressed SDP, lifecycle tracking)
-    Peer sends command "webrtc_offer"  (data = base64(zstd(offer JSON)))
-      → Anedya MQTT command event
-      → _handle_command()
-      → _handle_offer_commands()
-      → device publishes status "processing" with ack data = base64(zstd(answer SDP))
-      → Peer polls the command status, reads the answer, completes the handshake
-      → device concludes the command "success" / "failure" (terminal)
-
-  "valuestore" — Anedya Value Store (offer_<id> / answer_<id>)
-    Peer writes offer_<id>
-      → Anedya MQTT VS_UPDATES event
-      → _handle_valuestore_update()
-      → _handle_offer_valuestore()
-      → device writes answer_<id>
-      → Peer reads answer and completes the WebRTC handshake
+Signaling via Anedya Commands (zstd-compressed SDP, lifecycle tracking):
+  Peer sends command "webrtc_offer"  (data = base64(zstd(offer JSON)))
+    → Anedya MQTT command event
+    → _handle_command()
+    → _handle_offer_commands()
+    → device publishes status "processing" with ack data = base64(zstd(answer SDP))
+    → Peer polls the command status, reads the answer, completes the handshake
+    → device concludes the command "success" / "failure" (terminal)
 
 Responsibilities:
   - Connect to the Anedya MQTT broker and subscribe to relevant topics.
@@ -65,15 +55,12 @@ from config import (
     RECORDING_MIN_FREE_MB,
     RECORDING_RETENTION_SECONDS,
     RECORDING_SEGMENT_SECONDS,
-    SIGNALING_METHOD,
     TOPIC_COMMANDS,
     TOPIC_COMMAND_STATUS,
     TOPIC_ERRORS,
     TOPIC_HEARTBEAT,
     TOPIC_LOGS,
     TOPIC_RESPONSES,
-    TOPIC_VALUESTORE_SET,
-    TOPIC_VALUESTORE_UPDATES,
 )
 from audio import MicrophoneSource
 from recording import RecordingManager
@@ -197,7 +184,6 @@ class CameraStreamer:
         camera_index: int,
         source_mode: str = "usb",
         source_url: str = "",
-        signaling_method: str = "commands",
         enable_audio: bool = True,
         record_path: str = "recordings",
         enable_motion_detection: bool = False,
@@ -205,7 +191,6 @@ class CameraStreamer:
         self.camera_index = camera_index
         self.source_mode = source_mode
         self.source_url = source_url
-        self.signaling_method = signaling_method
         self.enable_audio = enable_audio
         self.enable_motion_detection = enable_motion_detection
 
@@ -297,17 +282,9 @@ class CameraStreamer:
 
     def _on_mqtt_connect(self, client, _userdata, _flags, rc) -> None:
         if rc == 0:
-            log.info(
-                "Connected to Anedya broker — signaling mode: %s",
-                self.signaling_method.upper(),
-            )
+            log.info("Connected to Anedya broker — signaling mode: COMMANDS")
 
-            # Subscribe based on signaling method
-            if self.signaling_method == "commands":
-                client.subscribe(TOPIC_COMMANDS)
-            else:
-                client.subscribe(TOPIC_VALUESTORE_UPDATES)
-
+            client.subscribe(TOPIC_COMMANDS)
             client.subscribe(TOPIC_RESPONSES)
             client.subscribe(TOPIC_ERRORS)
 
@@ -350,8 +327,6 @@ class CameraStreamer:
 
         if message.topic == TOPIC_COMMANDS:
             self._handle_command(payload)
-        elif message.topic == TOPIC_VALUESTORE_UPDATES:
-            self._handle_valuestore_update(payload)
         elif message.topic == TOPIC_RESPONSES:
             if not payload.get("success", True):
                 log.warning("MQTT response error: %s", payload)
@@ -517,120 +492,7 @@ class CameraStreamer:
         else:
             self._publish_command_status(command_id, CMD_STATUS_FAILED, reason or None)
 
-    # ══════════════════════════════════════════════════════════════
-    #  VALUE-STORE-BASED SIGNALING
-    # ══════════════════════════════════════════════════════════════
 
-    def _handle_valuestore_update(self, payload: dict) -> None:
-        """Dispatch an async offer-handling coroutine when an offer key arrives."""
-        log.debug("Value-store update: %s", payload)
-        key = payload.get("key", "")
-        if not key.startswith("offer_"):
-            log.info("Value-store update ignored (key=%r)", key)
-            return
-
-        session_id = key[len("offer_"):]
-        log.info("Incoming WebRTC offer [valuestore] (session=%s)", session_id)
-        assert self._event_loop is not None
-
-        future = asyncio.run_coroutine_threadsafe(
-            self._handle_offer_valuestore(session_id, payload.get("value", "")),
-            self._event_loop,
-        )
-        future.add_done_callback(
-            lambda f: (
-                log.error("_handle_offer_valuestore raised: %s", f.exception())
-                if f.exception()
-                else None
-            )
-        )
-
-    def _write_to_valuestore(self, key: str, value: str) -> None:
-        """Publish a string value to the Anedya value store over MQTT."""
-        assert self._mqtt_client is not None
-        message = json.dumps({
-            "reqId": "",
-            "key":   key,
-            "value": value,
-            "type":  "string",
-        })
-        self._mqtt_client.publish(TOPIC_VALUESTORE_SET, message, qos=1)
-        log.debug("Value-store write: key=%s", key)
-
-    async def _handle_offer_valuestore(self, session_id: str, raw_value: str) -> None:
-        """Handle an offer via Value Store signaling (plain JSON)."""
-        try:
-            data = json.loads(raw_value)
-            offer_sdp = data["offer"]
-        except Exception as exc:
-            log.error("Malformed offer payload (session=%s): %s", session_id, exc)
-            return
-
-        log.info("Processing offer [valuestore] (session=%s)", session_id)
-
-        turn_data = data.get("turn")
-        if not turn_data:
-            log.error("No TURN credentials in offer (session=%s)", session_id)
-            return
-
-        try:
-            ice_servers = build_turn_ice_servers(
-                turn_data["endpoint"],
-                turn_data["username"],
-                turn_data["credential"],
-            )
-        except (KeyError, ValueError) as exc:
-            log.error("Invalid TURN data in offer (session=%s): %s", session_id, exc)
-            return
-
-        if self.source is None:
-            log.error("Camera source not ready — cannot handle offer (session=%s)", session_id)
-            return
-
-        if session_id in self._active_peers:
-            log.warning("Session %s already active — closing stale connection", session_id)
-            await self._close_peer_session(session_id)
-
-        # Create peer connection + tracks
-        peer_connection, video_track, audio_track = self._create_peer(ice_servers)
-
-        self._active_peers[session_id] = {
-            "pc": peer_connection,
-            "video": video_track,
-            "audio": audio_track,
-            "concluded": False,
-        }
-        peer_connection.addTrack(video_track)
-        if audio_track:
-            peer_connection.addTrack(audio_track)
-
-        # Register event handlers
-        self._setup_data_channel_handler(peer_connection, video_track, session_id)
-
-        @peer_connection.on("connectionstatechange")
-        async def on_connection_state_change():
-            state = peer_connection.connectionState
-            log.info("Peer connection state: %s (session=%s)", state, session_id)
-            if state in ("failed", "closed"):
-                await self._close_peer_session(session_id)
-
-        # SDP handshake
-        await peer_connection.setRemoteDescription(
-            RTCSessionDescription(sdp=offer_sdp["sdp"], type=offer_sdp["type"])
-        )
-        answer = await peer_connection.createAnswer()
-        await peer_connection.setLocalDescription(answer)
-
-        # Wait for ICE gathering
-        await self._wait_for_ice_gathering(peer_connection, session_id)
-
-        # Publish answer via value store (plain JSON)
-        answer_payload = json.dumps({
-            "sdp":  peer_connection.localDescription.sdp,
-            "type": peer_connection.localDescription.type,
-        })
-        self._write_to_valuestore(f"answer_{session_id}", answer_payload)
-        log.info("Answer published to value store (session=%s)", session_id)
 
     # ══════════════════════════════════════════════════════════════
     #  SHARED HELPERS
@@ -789,9 +651,8 @@ class CameraStreamer:
 
         self.source = source
         log.info(
-            "Streamer running — camera=%s, signaling=%s, recording started, waiting for peers",
+            "Streamer running — camera=%s, signaling=COMMANDS, recording started, waiting for peers",
             self.source_mode.upper(),
-            self.signaling_method.upper(),
         )
 
         # Main loop: wait for peers to connect and handle them

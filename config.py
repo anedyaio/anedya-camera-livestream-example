@@ -12,8 +12,6 @@ Environment variables required (set in unified-streamer/.env — never commit th
 
     CAMERA_SOURCE          "usb" or "rtsp"  (default: usb)
     CAMERA_SOURCE_URL      RTSP URL — required when CAMERA_SOURCE=rtsp
-
-    SIGNALING_METHOD       "commands" or "valuestore"  (default: commands)
 """
 
 import logging
@@ -98,9 +96,6 @@ ANEDYA_REGION         = os.environ.get("ANEDYA_REGION",         "ap-in-1")
 CAMERA_SOURCE = os.environ.get("CAMERA_SOURCE", "usb").strip().lower()
 CAMERA_SOURCE_URL = os.environ.get("CAMERA_SOURCE_URL", "").strip()
 
-# ── Signaling method selection ────────────────────────────────────
-SIGNALING_METHOD = os.environ.get("SIGNALING_METHOD", "commands").strip().lower()
-
 
 def get_int_env(name: str, default: int, minimum: int | None = None) -> int:
     """Read an integer env var with validation and a safe fallback."""
@@ -163,15 +158,10 @@ CjAIMAYGBFUdIAAwCgYIKoZIzj0EAwIDRwAwRAIgR/rWSG8+L4XtFLces0JYS7bY
 -----END CERTIFICATE-----"""
 
 # ── MQTT topics ───────────────────────────────────────────────────
-# Commands-based signaling topics (used when SIGNALING_METHOD=commands)
 TOPIC_COMMANDS           = f"$anedya/device/{ANEDYA_DEVICE_ID}/commands"
 TOPIC_COMMAND_STATUS     = f"$anedya/device/{ANEDYA_DEVICE_ID}/commands/updateStatus/json"
 
-# Value-store signaling topics (used when SIGNALING_METHOD=valuestore)
-TOPIC_VALUESTORE_UPDATES = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/updates/json"
-TOPIC_VALUESTORE_SET     = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/setValue/json"
-
-# Common topics (both signaling methods)
+# Common topics
 TOPIC_RESPONSES          = f"$anedya/device/{ANEDYA_DEVICE_ID}/response"
 TOPIC_ERRORS             = f"$anedya/device/{ANEDYA_DEVICE_ID}/errors"
 TOPIC_HEARTBEAT          = f"$anedya/device/{ANEDYA_DEVICE_ID}/heartbeat/json"
@@ -270,8 +260,3 @@ def validate_anedya_config() -> None:
             "Example: CAMERA_SOURCE_URL=rtsp://10.23.0.220:554/cam/realmonitor?channel=1&subtype=0"
         )
 
-    if SIGNALING_METHOD not in ("commands", "valuestore"):
-        raise RuntimeError(
-            f"Invalid SIGNALING_METHOD={SIGNALING_METHOD!r}. "
-            "Must be 'commands' or 'valuestore'."
-        )

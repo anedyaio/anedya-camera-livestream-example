@@ -26,23 +26,23 @@ Turn a Raspberry Pi into a CCTV-style camera system using Anedya for signaling a
 
 ## 🏗 How It Works
 
-### Signaling via Anedya ValueStore + MQTT
+### Signaling via Anedya Commands + MQTT
 
-WebRTC requires both peers to exchange SDP offers and answers before media can flow. This example uses Anedya ValueStore as a signaling channel and Anedya MQTT as the notification mechanism.
+WebRTC requires both peers to exchange SDP offers and answers before media can flow. This example uses Anedya Commands as a signaling channel and Anedya MQTT as the notification mechanism.
 
 ```
 Peer App
   │  1. Fetch TURN credentials (Anedya REST API)
-  │  2. Create WebRTC offer + write offer_<sessionId> to ValueStore
+  │  2. Send compressed offer as "webrtc_offer" command
   ▼
-Anedya Cloud  (ValueStore + MQTT broker + TURN relay)
-  │  3. Notify Pi over MQTT subscription
+Anedya Cloud  (Commands + MQTT broker + TURN relay)
+  │  3. Notify Pi over MQTT command topic ($anedya/device/<id>/commands)
   ▼
 Pi Streamer
-  │  4. Create WebRTC answer + write answer_<sessionId> to ValueStore
+  │  4. Create WebRTC answer + reply via command status ("processing" with ackdata)
   ▼
 Peer App
-  │  5. Poll ValueStore → read answer → apply remote description
+  │  5. Read command status ackdata → decompress answer → apply remote description
   │  6. ICE negotiation completes
   │  7. Media flows (video + audio) — DataChannel for playback controls
 ```
@@ -304,7 +304,7 @@ This project uses OpenCV `VideoCapture`.
 - [Anedya Concepts](https://docs.anedya.io/essentials/concepts/)
 - [Anedya Project Setup](https://docs.anedya.io/getting-started/project-setup/)
 - [Anedya MQTT Endpoints](https://docs.anedya.io/device/mqtt-endpoints/)
-- [Anedya ValueStore](https://docs.anedya.io/features/valuestore/valuestore-intro/)
+- [Anedya Commands](https://docs.anedya.io/features/commands/commands-intro/)
 - [Anedya Platform API](https://docs.anedya.io/platform-api/)
 
 **WebRTC**
