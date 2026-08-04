@@ -1,19 +1,22 @@
 """
-Centralised configuration for the Pi Cam streamer.
+Centralised configuration for the unified camera streamer.
 
-Reads Anedya credentials from environment variables,
-defines all shared constants, sets up logging, and provides a startup
-validation helper.
+Reads Anedya credentials and camera/signaling preferences from
+environment variables, defines all shared constants, sets up logging,
+and provides a startup validation helper.
 
-Environment variables required (set in streamer/.env — never commit that file):
+Environment variables required (set in unified-streamer/.env — never commit that file):
     ANEDYA_DEVICE_ID       Device UUID from the Anedya console
-    ANEDYA_NODE_ID         Node UUID from the Anedya console
     ANEDYA_CONNECTION_KEY  Device connection key from the Anedya console
     ANEDYA_REGION          API / MQTT region slug  (default: ap-in-1)
+
+    CAMERA_SOURCE          "usb" or "rtsp"  (default: usb)
+    CAMERA_SOURCE_URL      RTSP URL — required when CAMERA_SOURCE=rtsp
 """
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 
@@ -21,11 +24,38 @@ from pathlib import Path
 logging.getLogger("aioice").setLevel(logging.WARNING)
 logging.getLogger("aiortc").setLevel(logging.WARNING)
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%H:%M:%S",
+class ConsoleColorFormatter(logging.Formatter):
+    """Add ANSI colors to local console logs without changing remote log text."""
+
+    COLORS = {
+        logging.DEBUG: "\033[36m",    # cyan
+        logging.INFO: "\033[32m",     # green
+        logging.WARNING: "\033[33m",  # yellow
+        logging.ERROR: "\033[31m",    # red
+        logging.CRITICAL: "\033[35m", # magenta
+    }
+    RESET = "\033[0m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        original_levelname = record.levelname
+        color = self.COLORS.get(record.levelno)
+        try:
+            if color and sys.stderr.isatty() and "NO_COLOR" not in os.environ:
+                record.levelname = f"{color}{record.levelname}{self.RESET}"
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
+
+
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(
+    ConsoleColorFormatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
 )
+
+logging.basicConfig(level=logging.DEBUG, handlers=[_console_handler])
 
 log = logging.getLogger("streamer")
 
@@ -57,10 +87,14 @@ load_env_file(Path(__file__).with_name(".env"))
 load_env_file(Path.cwd() / ".env")
 
 
+# ── Anedya credentials ────────────────────────────────────────────
 ANEDYA_DEVICE_ID      = os.environ.get("ANEDYA_DEVICE_ID",      "")
-ANEDYA_NODE_ID        = os.environ.get("ANEDYA_NODE_ID",        "")
 ANEDYA_CONNECTION_KEY = os.environ.get("ANEDYA_CONNECTION_KEY", "")
 ANEDYA_REGION         = os.environ.get("ANEDYA_REGION",         "ap-in-1")
+
+# ── Camera source selection ───────────────────────────────────────
+CAMERA_SOURCE = os.environ.get("CAMERA_SOURCE", "usb").strip().lower()
+CAMERA_SOURCE_URL = os.environ.get("CAMERA_SOURCE_URL", "").strip()
 
 
 def get_int_env(name: str, default: int, minimum: int | None = None) -> int:
@@ -75,6 +109,30 @@ def get_int_env(name: str, default: int, minimum: int | None = None) -> int:
         return default
     if minimum is not None and value < minimum:
         log.warning("%s=%d is below minimum %d; using %d", name, value, minimum, default)
+        return default
+    return value
+
+
+def get_float_env(
+    name: str,
+    default: float,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float:
+    """Read a float env var with range validation and a safe fallback."""
+    raw_value = os.environ.get(name, "").strip()
+    if not raw_value:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError:
+        log.warning("Invalid %s=%r; using %.2f", name, raw_value, default)
+        return default
+    if minimum is not None and value < minimum:
+        log.warning("%s=%.2f is below minimum %.2f; using %.2f", name, value, minimum, default)
+        return default
+    if maximum is not None and value > maximum:
+        log.warning("%s=%.2f is above maximum %.2f; using %.2f", name, value, maximum, default)
         return default
     return value
 
@@ -99,14 +157,20 @@ CjAIMAYGBFUdIAAwCgYIKoZIzj0EAwIDRwAwRAIgR/rWSG8+L4XtFLces0JYS7bY
 5NH1diiFk54/E5xmSaICIEYYbhvjrdR0GVLjoay6gFspiRZ7GtDDr9xF91WbsK0P
 -----END CERTIFICATE-----"""
 
-TOPIC_VALUESTORE_UPDATES = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/updates/json"
-TOPIC_VALUESTORE_SET     = f"$anedya/device/{ANEDYA_DEVICE_ID}/valuestore/setValue/json"
+# ── MQTT topics ───────────────────────────────────────────────────
+TOPIC_COMMANDS           = f"$anedya/device/{ANEDYA_DEVICE_ID}/commands"
+TOPIC_COMMAND_STATUS     = f"$anedya/device/{ANEDYA_DEVICE_ID}/commands/updateStatus/json"
+
+# Common topics
 TOPIC_RESPONSES          = f"$anedya/device/{ANEDYA_DEVICE_ID}/response"
 TOPIC_ERRORS             = f"$anedya/device/{ANEDYA_DEVICE_ID}/errors"
 TOPIC_HEARTBEAT          = f"$anedya/device/{ANEDYA_DEVICE_ID}/heartbeat/json"
+TOPIC_LOGS               = f"$anedya/device/{ANEDYA_DEVICE_ID}/logs/submitLogs/json"
 HEARTBEAT_INTERVAL_SECONDS = MQTT_KEEPALIVE
 
+# ── Recording ─────────────────────────────────────────────────────
 RECORDING_SEGMENT_SECONDS = get_int_env("RECORDING_SEGMENT_SECONDS", 5, minimum=1)
+RECORDING_MIN_FREE_MB = get_int_env("RECORDING_MIN_FREE_MB", 512, minimum=0)
 
 RECORDING_RETENTION_DAYS  = get_int_env("RECORDING_RETENTION_DAYS", 1, minimum=0)
 RECORDING_RETENTION_HOURS = get_int_env("RECORDING_RETENTION_HOURS", 0, minimum=0)
@@ -122,10 +186,12 @@ if RECORDING_RETENTION_SECONDS <= 0:
     )
     RECORDING_RETENTION_SECONDS = 24 * 60 * 60
 
+# ── Audio ─────────────────────────────────────────────────────────
 AUDIO_SAMPLE_RATE   = 48000  # Hz — standard WebRTC audio sample rate
 AUDIO_CHANNELS      = 1      # mono
 AUDIO_FRAME_SAMPLES = 960    # 20 ms at 48 kHz — standard WebRTC frame size
 
+# ── Camera resolution ─────────────────────────────────────────────
 # Resolution candidates tried highest-first. The driver clamps unsupported
 # modes to the best available, so requesting 8K first is safe.
 CAPTURE_RESOLUTION_CANDIDATES = [
@@ -139,6 +205,7 @@ CAPTURE_RESOLUTION_CANDIDATES = [
     (1280,  720),
 ]
 
+# ── Motion detection ──────────────────────────────────────────────
 # Motion detection runs on a downscaled frame to keep CPU usage low.
 MOTION_ANALYSIS_WIDTH  = get_int_env("MOTION_ANALYSIS_WIDTH",  320, minimum=64)
 MOTION_ANALYSIS_HEIGHT = get_int_env("MOTION_ANALYSIS_HEIGHT", 240, minimum=48)
@@ -149,6 +216,13 @@ MOTION_THRESHOLD_PX = get_int_env("MOTION_THRESHOLD_PX", 1200, minimum=1)
 
 # Seconds between repeated motion-detected log events / triggers.
 MOTION_COOLDOWN_SECONDS = get_int_env("MOTION_COOLDOWN_SECONDS", 5, minimum=0)
+
+# Fraction of frame height (from top) excluded from motion analysis.
+# 0.5 = analyse lower half only (default — avoids sky/ceiling false positives).
+# 0.0 = analyse full frame. 0.25 = skip top quarter only.
+MOTION_ROI_TOP_FRACTION = get_float_env(
+    "MOTION_ROI_TOP_FRACTION", default=0.5, minimum=0.0, maximum=0.95
+)
 
 
 def validate_anedya_config() -> None:
@@ -161,7 +235,6 @@ def validate_anedya_config() -> None:
         name
         for name, value in {
             "ANEDYA_DEVICE_ID":      ANEDYA_DEVICE_ID,
-            "ANEDYA_NODE_ID":        ANEDYA_NODE_ID,
             "ANEDYA_CONNECTION_KEY": ANEDYA_CONNECTION_KEY,
         }.items()
         if not value
@@ -172,5 +245,18 @@ def validate_anedya_config() -> None:
             "Missing required Anedya configuration: "
             + ", ".join(missing)
             + ". Set these as environment variables or create "
-            + "streamer/.env from streamer/.env.example."
+            + "unified-streamer/.env from unified-streamer/.env.example."
         )
+
+    if CAMERA_SOURCE not in ("usb", "rtsp"):
+        raise RuntimeError(
+            f"Invalid CAMERA_SOURCE={CAMERA_SOURCE!r}. "
+            "Must be 'usb' or 'rtsp'."
+        )
+
+    if CAMERA_SOURCE == "rtsp" and not CAMERA_SOURCE_URL:
+        raise RuntimeError(
+            "CAMERA_SOURCE=rtsp requires CAMERA_SOURCE_URL to be set. "
+            "Example: CAMERA_SOURCE_URL=rtsp://10.23.0.220:554/cam/realmonitor?channel=1&subtype=0"
+        )
+

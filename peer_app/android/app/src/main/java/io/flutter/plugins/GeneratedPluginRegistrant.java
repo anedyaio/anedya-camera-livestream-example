@@ -40,5 +40,10 @@ public final class GeneratedPluginRegistrant {
     } catch (Exception e) {
       Log.e(TAG, "Error registering plugin shared_preferences_android, io.flutter.plugins.sharedpreferences.SharedPreferencesPlugin", e);
     }
+    try {
+      flutterEngine.getPlugins().add(new dev.vyp.zstandard_android.ZstandardAndroidPlugin());
+    } catch (Exception e) {
+      Log.e(TAG, "Error registering plugin zstandard_android, dev.vyp.zstandard_android.ZstandardAndroidPlugin", e);
+    }
   }
 }

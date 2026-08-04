@@ -65,15 +65,120 @@
       color: #f87171;
     }
 
-    video {
+    #deviceStatus {
+      font-size: 0.8rem;
+      padding: 0.35rem 0.75rem;
+      border-radius: 999px;
+      background: #222;
+      color: #aaa;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+    }
+
+    #deviceStatus::before {
+      content: "";
+      width: 0.55rem;
+      height: 0.55rem;
+      border-radius: 50%;
+      background: #777;
+    }
+
+    #deviceStatus.online {
+      background: #14532d;
+      color: #4ade80;
+    }
+
+    #deviceStatus.online::before {
+      background: #4ade80;
+    }
+
+    #deviceStatus.offline {
+      background: #450a0a;
+      color: #f87171;
+    }
+
+    #deviceStatus.offline::before {
+      background: #f87171;
+    }
+
+    #deviceStatus.unknown::before {
+      background: #777;
+    }
+
+    #videoContainer {
+      position: relative;
       width: 100%;
       max-width: 640px;
+    }
+
+    video {
+      width: 100%;
       height: auto;
       background: #111;
       border-radius: 0.75rem;
       object-fit: contain;
       display: block;
     }
+
+    /* Fake fullscreen: we fullscreen the whole <html> (see fullscreenBtn) and
+       expand the container with this body class instead of making the <video>
+       the fullscreen element. If the video were the fullscreen subject, Chrome
+       promotes it to a hardware overlay plane that hides the watermark. */
+    body.fs #videoContainer {
+      position: fixed;
+      inset: 0;
+      max-width: none;
+      width: 100vw;
+      height: 100vh;
+      z-index: 9999;
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    body.fs #videoContainer video {
+      max-height: 100vh;
+      border-radius: 0;
+      /* Make the video INELIGIBLE for Chrome's DirectComposition hardware
+         overlay plane, which otherwise composites above all DOM and hides the
+         watermark after 1-2 s. A sub-1 opacity (visually identical) forces the
+         video onto a normal GPU layer where the watermark's z-index wins.
+         See https://issues.chromium.org/issues/40900941 */
+      opacity: 0.999;
+    }
+
+    .watermark {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 9px;
+      border-radius: 6px;
+      background: rgba(0, 0, 0, 0.4);
+      opacity: 0.8;
+      pointer-events: none;
+      font-size: 0.72rem;
+      letter-spacing: 0.02em;
+      color: #fff;
+      z-index: 2147483647;
+      /* Force our own GPU layer so we stay above the video's fullscreen
+         hardware-overlay plane (which otherwise hides us after 1-2 s). */
+      will-change: transform;
+      transform: translateZ(0);
+    }
+
+    .watermark svg {
+      height: 12px;
+      width: auto;
+      display: block;
+    }
+
+    .watermark .st0 { fill: #fff; }
+    .watermark .st1 { fill: #1fa2ff; }
 
     .btn-row {
       display: flex;
@@ -237,9 +342,47 @@
 
 <body>
   <h1>PI CAM</h1>
+  <div id="deviceStatus" class="unknown">Device: —</div>
   <div id="status">Connecting...</div>
   <div id="networkMode">Mode: --</div>
-  <video id="video" autoplay playsinline></video>
+  <div id="videoContainer">
+    <video id="video" autoplay playsinline></video>
+    <div class="watermark" aria-hidden="true">
+      <span>Powered By</span>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 427.45 85.62" role="img" aria-label="Anedya">
+        <g>
+          <g>
+            <polygon class="st0" points="115.61,23.38 105.39,23.38 89.02,62.25 96.34,62.25 110.53,28.24 124.71,62.25 131.98,62.25 "></polygon>
+            <path class="st0" d="M186.3,23.38v29.88l-19.94-29.88h-10.78v38.88h7.54V31.53l20.49,30.73h10.22V23.38H186.3z"></path>
+            <rect x="219.7" y="23.38" class="st0" width="28.97" height="6.52"></rect>
+            <rect x="213.91" y="23.38" class="st0" width="6.52" height="38.88"></rect>
+            <rect x="219.7" y="39.56" class="st0" width="28.97" height="6.52"></rect>
+            <rect x="219.7" y="55.74" class="st0" width="28.97" height="6.52"></rect>
+            <path class="st0" d="M307.39,25.81c-1.62-1.62-3.55-2.42-5.81-2.42H269.8v38.88h31.77c2.26,0,4.2-0.81,5.81-2.42 c1.59-1.59,2.4-3.53,2.4-5.79V31.6C309.79,29.36,308.98,27.42,307.39,25.81z M302.79,51.81c0,0.97-0.35,1.78-1.04,2.45 c-0.69,0.67-1.5,1.02-2.47,1.02h-22.52V30.35h22.52c0.97,0,1.78,0.35,2.47,1.04s1.04,1.52,1.04,2.49V51.81z"></path>
+            <path class="st0" d="M361.89,23.38l-10.41,17.58L341.1,23.38h-7.98l14.63,24.18v14.7h7.54v-14.7l14.63-24.18H361.89z"></path>
+            <polygon class="st0" points="411.08,23.38 400.86,23.38 384.5,62.25 391.81,62.25 406,28.24 420.19,62.25 427.45,62.25 "></polygon>
+          </g>
+          <g>
+            <path class="st1" d="M71.96,34.55L54.24,16.83c-0.04,0.29-0.12,0.57-0.26,0.83c0.81,3.11,1.77,10.17-4.02,15.96L2.83,80.75 c-1.7,1.7-0.51,4.61,1.9,4.63l30.21,0.25c1.65,0.01,3.24-0.64,4.4-1.8l32.63-32.63C76.56,46.6,76.56,39.15,71.96,34.55z"></path>
+            <path class="st1" d="M35.32,5.38H19.33c-1.49,0-2.69-1.2-2.69-2.69v0c0-1.49,1.2-2.69,2.69-2.69l15.98,0 c1.49,0,2.69,1.2,2.69,2.69v0C38.01,4.18,36.8,5.38,35.32,5.38z"></path>
+            <path class="st1" d="M43.7,13.41H27.72c-1.49,0-2.69-1.2-2.69-2.69v0c0-1.49,1.2-2.69,2.69-2.69H43.7c1.49,0,2.69,1.2,2.69,2.69v0 C46.39,12.21,45.18,13.41,43.7,13.41z"></path>
+            <path class="st1" d="M54.88,21.44H36.37c-1.49,0-2.69-1.2-2.69-2.69v0c0-1.49,1.2-2.69,2.69-2.69h15.98c1.49,0,2.69,1.2,2.69,2.69 v0C55.04,20.24,56.36,21.44,54.88,21.44z"></path>
+            <path class="st1" d="M58.24,24.09H44.75c-1.49,0-2.69,1.2-2.69,2.69c0,1.49,1.2,2.69,2.69,2.69h13.49V24.09z"></path>
+            <circle class="st1" cx="11.34" cy="2.69" r="2.69"></circle>
+            <circle class="st1" cx="2.69" cy="2.69" r="2.69"></circle>
+            <circle class="st1" cx="19.72" cy="10.72" r="2.69"></circle>
+            <circle class="st1" cx="11.07" cy="10.72" r="2.69"></circle>
+            <circle class="st1" cx="28.38" cy="18.75" r="2.69"></circle>
+            <circle class="st1" cx="19.72" cy="18.75" r="2.69"></circle>
+            <circle class="st1" cx="36.8" cy="26.78" r="2.69"></circle>
+            <circle class="st1" cx="28.14" cy="26.78" r="2.69"></circle>
+            <circle class="st1" cx="45.45" cy="35.06" r="2.69"></circle>
+            <circle class="st1" cx="36.8" cy="35.06" r="2.69"></circle>
+          </g>
+        </g>
+      </svg>
+    </div>
+  </div>
 
   <div class="toolbar">
       <button id="fullscreenBtn" type="button">⛶</button>
@@ -288,6 +431,51 @@
 
   <pre id="log"></pre>
 
+  <!--
+    zstd + trained-dictionary compression for signaling payloads.
+    The offer (and the Pi's answer) are large WebRTC SDPs whose bulk is constant
+    boilerplate. A shared trained dictionary lets each payload carry only its
+    deltas, shrinking the value-store payload dramatically. This module exposes
+    window.sdpCompress / sdpDecompress once the WASM + dictionary are ready.
+    The dictionary bytes MUST match streamer/signaling_dict.bin on the device.
+  -->
+  <script type="module">
+    import { init, createCCtx, compressUsingDict, createDCtx, decompressUsingDict }
+      from './vendor/zstd/index.web.js';
+
+    const ZSTD_LEVEL = 19;
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+
+    const bytesToB64 = (u8) => {
+      let s = '';
+      for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]);
+      return btoa(s);
+    };
+    const b64ToBytes = (b64) => {
+      const bin = atob(b64);
+      const u8 = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+      return u8;
+    };
+
+    // Resolves once WASM is initialized and the dictionary is loaded. Signaling
+    // code awaits this before compressing/decompressing.
+    window.zstdReady = (async () => {
+      await init();
+      const dict = new Uint8Array(
+        await (await fetch('./vendor/zstd-dict.bin')).arrayBuffer());
+
+      // JSON string -> base64(zstd-with-dict)
+      window.sdpCompress = (jsonStr) =>
+        bytesToB64(compressUsingDict(createCCtx(), encoder.encode(jsonStr), dict, ZSTD_LEVEL));
+
+      // base64(zstd-with-dict) -> JSON string
+      window.sdpDecompress = (b64) =>
+        decoder.decode(decompressUsingDict(createDCtx(), b64ToBytes(b64), dict));
+    })();
+  </script>
+
   <script>
     /*
       Browser-side viewer.
@@ -302,6 +490,7 @@
 
     // UI references.
     const statusEl = document.getElementById('status');
+    const deviceStatusEl = document.getElementById('deviceStatus');
     const networkModeEl = document.getElementById('networkMode');
     const startBtn = document.getElementById('startBtn');
     const stopBtn = document.getElementById('stopBtn');
@@ -373,13 +562,15 @@
     }
 
     function relayOnlyEnabled() {
-      return relayOnlyToggle.checked;
+      return relayOnlyToggle?.checked ?? false;
     }
 
     function syncSettingsUI() {
       nodeIdInput.value = localStorage.getItem(STORAGE_KEYS.nodeId) || '';
       apiKeyInput.value = localStorage.getItem(STORAGE_KEYS.apiKey) || '';
-      relayOnlyToggle.checked = localStorage.getItem(STORAGE_KEYS.relayOnly) === 'true';
+      if (relayOnlyToggle) {
+        relayOnlyToggle.checked = localStorage.getItem(STORAGE_KEYS.relayOnly) === 'true';
+      }
     }
 
     function formatTime(totalSeconds) {
@@ -536,28 +727,48 @@
       liveBtn.style.display = 'inline-block';
     });
 
-    async function vsSet(key, value) {
-      const resp = await fetch(`${ANEDYA_API_BASE}/valuestore/setValue`, {
+    // --- WebRTC signaling over Anedya Commands -----------------------------
+    // The offer is sent as the "webrtc_offer" command; the Pi replies by
+    // attaching the compressed answer SDP as this command's ackdata.
+
+    // Send the compressed offer as a command. Returns the Anedya-assigned
+    // commandId, which correlates the answer back to this offer.
+    async function sendOfferViaCommand(dataB64) {
+      const resp = await fetch(`${ANEDYA_API_BASE}/commands/send`, {
         method: 'POST',
         headers: getVsHeaders(),
-        body: JSON.stringify({ namespace: getVsNamespace(), key, value, type: 'string' }),
+        body: JSON.stringify({
+          nodeId: getNodeId(),
+          command: 'webrtc_offer',
+          data: dataB64,
+          // "string": the compressed offer base64 (~570 B) is well under the
+          // 1023-char cap. (Binary type mangles the inbound command payload on
+          // the device side, so we keep the offer as string.)
+          type: 'string',
+          expiry: Date.now() + 300_000,
+        }),
       });
       if (!resp.ok) {
-        const text = await resp.text();
-        throw new Error(`vsSet failed: ${resp.status} - ${text}`);
+        throw new Error(`Command send failed: ${resp.status} ${await resp.text()}`);
       }
+      const json = await resp.json();
+      // Field name has varied across API versions; accept whichever is present.
+      const commandId = json.commandId || json.id || json.commandID;
+      if (!commandId) {
+        throw new Error(`Command send returned no id: ${JSON.stringify(json)}`);
+      }
+      return commandId;
     }
 
-    async function vsGet(key) {
-      const resp = await fetch(`${ANEDYA_API_BASE}/valuestore/getValue`, {
+    // Poll a command's details: status + ackdata (base64(zstd(answer SDP))).
+    async function getCommandStatus(commandId) {
+      const resp = await fetch(`${ANEDYA_API_BASE}/commands/getDetails`, {
         method: 'POST',
         headers: getVsHeaders(),
-        body: JSON.stringify({ namespace: getVsNamespace(), key }),
+        body: JSON.stringify({ commandId }),
       });
       if (!resp.ok) return null;
-      const json = await resp.json();
-      if (!json.value) return null;
-      return json.value;
+      return await resp.json();
     }
 
     async function fetchTurnCredentials() {
@@ -574,6 +785,70 @@
         password: json.relayData.credential,
         relayExpiry: json.relayExpiry,
       };
+    }
+
+    // --- Device online/offline status -------------------------------------
+    // The Pi heartbeats Anedya every ~30 s. We ask Anedya's health API whether
+    // the node has been seen within DEVICE_STATUS_THRESHOLD_SECONDS, both as a
+    // live badge (polled) and as a gate before starting a stream.
+    const DEVICE_STATUS_THRESHOLD_SECONDS = 90;
+    const DEVICE_STATUS_POLL_MS = 10000;
+    let deviceStatusTimer = null;
+
+    // Returns { online, lastHeartbeat } for the configured node, or throws.
+    async function fetchNodeHealth() {
+      const nodeId = getNodeId();
+      const resp = await fetch(`${ANEDYA_API_BASE}/health/status`, {
+        method: 'POST',
+        headers: getVsHeaders(),
+        body: JSON.stringify({
+          nodes: [nodeId],
+          lastContactThreshold: DEVICE_STATUS_THRESHOLD_SECONDS,
+        }),
+      });
+      if (!resp.ok) throw new Error(`Health check failed: ${resp.status}`);
+      const json = await resp.json();
+      if (json.success === false) {
+        throw new Error(json.error || json.reasonCode || 'health error');
+      }
+      const info = json.data?.[nodeId];
+      if (!info) throw new Error('health API returned no data for this node');
+      return info;
+    }
+
+    function setDeviceStatus(state, text) {
+      deviceStatusEl.className = state; // 'online' | 'offline' | 'unknown'
+      deviceStatusEl.textContent = text;
+    }
+
+    // Refresh the badge once. Never throws — network/config problems just show
+    // as "unknown" so the poller keeps running.
+    async function refreshDeviceStatus() {
+      if (!getNodeId()) { setDeviceStatus('unknown', 'Device: set Node ID'); return; }
+      if (!getApiKey()) { setDeviceStatus('unknown', 'Device: set API key'); return; }
+      try {
+        const info = await fetchNodeHealth();
+        if (info.online) {
+          const t = info.lastHeartbeat
+            ? new Date(info.lastHeartbeat * 1000).toLocaleTimeString()
+            : '—';
+          setDeviceStatus('online', `Device: ONLINE (last ${t})`);
+        } else {
+          const t = info.lastHeartbeat
+            ? new Date(info.lastHeartbeat * 1000).toLocaleString()
+            : 'never';
+          setDeviceStatus('offline', `Device: OFFLINE (last ${t})`);
+        }
+      } catch (err) {
+        setDeviceStatus('unknown', 'Device: status unknown');
+      }
+    }
+
+    // Start (or restart) the background poll. Call after settings change.
+    function startDeviceStatusPolling() {
+      if (deviceStatusTimer) clearInterval(deviceStatusTimer);
+      refreshDeviceStatus();
+      deviceStatusTimer = setInterval(refreshDeviceStatus, DEVICE_STATUS_POLL_MS);
     }
 
     function buildIceConfig(relayData) {
@@ -602,13 +877,23 @@
     fullscreenBtn.addEventListener('click', async () => {
       try {
         if (!document.fullscreenElement) {
-          await video.requestFullscreen();
+          // Fullscreen the whole document (not the <video> or its container) so
+          // Chrome does NOT promote the video to a hardware overlay plane that
+          // hides the watermark. The `fs` body class (toggled below) then
+          // expands the video container to fill the screen.
+          await document.documentElement.requestFullscreen();
         } else {
           await document.exitFullscreen();
         }
       } catch (err) {
         uiLog('Fullscreen error: ' + err.message);
       }
+    });
+
+    // Keep the `fs` class in sync with actual fullscreen state so it also clears
+    // when the user exits via Esc (which fires no button click).
+    document.addEventListener('fullscreenchange', () => {
+      document.body.classList.toggle('fs', !!document.fullscreenElement);
     });
 
     saveSettingsBtn.addEventListener('click', () => {
@@ -624,12 +909,16 @@
       } else {
         localStorage.removeItem(STORAGE_KEYS.apiKey);
       }
-      localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
-      uiLog(`Settings saved (${nodeId ? 'node set' : 'node missing'}, ${value ? 'key set' : 'key missing'}, relay ${relayOnlyToggle.checked ? 'forced' : 'auto'})`);
+      if (relayOnlyToggle) {
+        localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
+      }
+      uiLog(`Settings saved (${nodeId ? 'node set' : 'node missing'}, ${value ? 'key set' : 'key missing'})`);
       settingsPanel.style.display = 'none';
+      // Re-check device status immediately against the new node/key.
+      startDeviceStatusPolling();
     });
 
-    relayOnlyToggle.addEventListener('change', () => {
+    relayOnlyToggle?.addEventListener('change', () => {
       localStorage.setItem(STORAGE_KEYS.relayOnly, String(relayOnlyToggle.checked));
     });
 
@@ -656,8 +945,34 @@
 
       startBtn.disabled = true;
       stopBtn.disabled = false;
-      statusEl.textContent = 'Fetching TURN credentials...';
       statusEl.className = '';
+
+      // Step 0: bail out early if the Pi is offline — no point handshaking a
+      // device that has not heartbeated recently.
+      statusEl.textContent = 'Checking device status...';
+      try {
+        const info = await fetchNodeHealth();
+        if (!info.online) {
+          const last = info.lastHeartbeat
+            ? new Date(info.lastHeartbeat * 1000).toLocaleString()
+            : 'never';
+          setDeviceStatus('offline', `Device: OFFLINE (last ${last})`);
+          uiLog(`Device is OFFLINE (last heartbeat: ${last})`);
+          statusEl.textContent = 'Device offline';
+          statusEl.className = 'error';
+          resetUI();
+          return;
+        }
+        setDeviceStatus('online', 'Device: ONLINE');
+      } catch (err) {
+        uiLog('Device status check failed: ' + err.message);
+        statusEl.textContent = 'Status check failed';
+        statusEl.className = 'error';
+        resetUI();
+        return;
+      }
+
+      statusEl.textContent = 'Fetching TURN credentials...';
 
       // Step 1: browser asks Anedya for TURN credentials.
       let relayData;
@@ -775,52 +1090,76 @@
         uiLog('Warning: Failed to create relay candidate. Please check your quota limits.');
       }
 
-      // Step 4: write offer + TURN data into Anedya value store.
-      const sessionId = Math.random().toString(36).slice(2, 10);
-      const offerKey = `offer_${sessionId}`;
-      const answerKey = `answer_${sessionId}`;
-
+      // Step 4: send the offer as the "webrtc_offer" command.
+      let commandId;
       try {
         statusEl.textContent = 'Sending offer...';
-        const payload = JSON.stringify({
+        await window.zstdReady;
+        const offerJson = JSON.stringify({
           offer: { sdp: pc.localDescription.sdp, type: pc.localDescription.type },
           turn: relayData
         });
-        await vsSet(offerKey, payload);
-        uiLog(`Offer written (key=${offerKey}) - polling for answer...`);
+        // Compress (zstd + shared dict) + base64; the Pi decompresses with the
+        // identical dictionary. This is what makes a full media SDP fit a command.
+        const payload = window.sdpCompress(offerJson);
+        uiLog(`Offer: raw=${offerJson.length}B -> command payload=${payload.length}B`);
+        commandId = await sendOfferViaCommand(payload);
+        uiLog(`Offer sent (commandId=${commandId}) - polling for answer...`);
         statusEl.textContent = 'Waiting for Pi...';
       } catch (err) {
-        uiLog('Error writing offer: ' + err.message);
+        uiLog('Error sending offer: ' + err.message);
         statusEl.textContent = 'Error';
         statusEl.className = 'error';
         resetUI();
         return;
       }
 
-      // Step 5: poll for answer. Device writes answer into `answer_<sessionId>`.
+      // Step 5: poll the command status. The Pi attaches the compressed answer
+      // SDP as ackdata while status is "processing", then concludes success/failure.
       let attempts = 0;
-      const MAX_ATTEMPTS = 30;
+      let answerApplied = false;
+      const MAX_ATTEMPTS = 45;
       pollTimer = setInterval(async () => {
         attempts++;
         if (attempts > MAX_ATTEMPTS) {
           clearInterval(pollTimer); pollTimer = null;
-          uiLog('Timeout: Pi did not respond in time');
-          statusEl.textContent = 'Timeout';
-          statusEl.className = 'error';
-          stopStream();
+          if (!answerApplied) {
+            uiLog('Timeout: Pi did not respond in time');
+            statusEl.textContent = 'Timeout';
+            statusEl.className = 'error';
+            stopStream();
+          }
           return;
         }
 
         try {
-          const value = await vsGet(answerKey);
-          if (value) {
+          const cmd = await getCommandStatus(commandId);
+          if (!cmd) { uiLog(`Status fetch failed (${attempts})`); return; }
+
+          if (cmd.status === 'failure') {
             clearInterval(pollTimer); pollTimer = null;
-            const answerSdp = JSON.parse(value);
+            uiLog(`Command status=failure: ${cmd.ackdata || cmd.error || ''}`);
+            statusEl.textContent = 'Pi reported failure';
+            statusEl.className = 'error';
+            stopStream();
+            return;
+          }
+          if (cmd.status === 'success') {
+            clearInterval(pollTimer); pollTimer = null;
+            uiLog('Command status=success (Pi confirmed connection)');
+            return;
+          }
+
+          // The answer SDP rides in ackdata while status is "processing".
+          if (!answerApplied && cmd.ackdata) {
+            answerApplied = true;
+            // Same compression as the offer, reversed.
+            const answerSdp = JSON.parse(window.sdpDecompress(cmd.ackdata));
             await pc.setRemoteDescription(new RTCSessionDescription(answerSdp));
             uiLog('Answer applied - WebRTC connecting...');
           }
         } catch (err) {
-          uiLog('Poll error: ' + err.message);
+          uiLog('Poll/apply answer error: ' + err.message);
         }
       }, 2000);
     });
@@ -831,6 +1170,7 @@
     statusEl.className = 'connected';
     startBtn.disabled = false;
     syncSettingsUI();
+    startDeviceStatusPolling();
   </script>
 </body>
 

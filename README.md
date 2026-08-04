@@ -14,11 +14,12 @@ Turn a Raspberry Pi into a CCTV-style camera system using Anedya for signaling a
 ## ✨ Features
 
 - **Live WebRTC video streaming :** low-latency peer-to-peer video using Anedya-managed STUN/TURN
+- **USB & RTSP Camera Support :** connect direct USB/CSI cameras or RTSP IP camera streams
 - **Local Recording :** continuous MP4 segments written to disk on the Pi
 - **Playback :** scrub through past footage from the viewer without any server-side transcoding
 - **Automatic max camera mode :** selects the highest usable camera capability for both live streaming and local recording
-- **Motion detection overlay :** bounding boxes drawn on detected motion regions in real time
-- **Microphone audio :** capture and stream Pi microphone audio alongside video
+- **Motion detection overlay :** bounding boxes drawn on detected motion regions in real time, with configurable ROI
+- **Microphone audio :** capture and stream Pi microphone audio alongside video (graceful fallback if audio hardware is absent)
 - **Web viewer :** browser-based viewer, no install required
 - **Mobile viewer :** Flutter app for Android and iOS
 
@@ -26,23 +27,23 @@ Turn a Raspberry Pi into a CCTV-style camera system using Anedya for signaling a
 
 ## 🏗 How It Works
 
-### Signaling via Anedya ValueStore + MQTT
+### Signaling via Anedya Commands + MQTT
 
-WebRTC requires both peers to exchange SDP offers and answers before media can flow. This example uses Anedya ValueStore as a signaling channel and Anedya MQTT as the notification mechanism.
+WebRTC requires both peers to exchange SDP offers and answers before media can flow. This example uses Anedya Commands as a signaling channel and Anedya MQTT as the notification mechanism.
 
 ```
 Peer App
   │  1. Fetch TURN credentials (Anedya REST API)
-  │  2. Create WebRTC offer + write offer_<sessionId> to ValueStore
+  │  2. Send compressed offer as "webrtc_offer" command
   ▼
-Anedya Cloud  (ValueStore + MQTT broker + TURN relay)
-  │  3. Notify Pi over MQTT subscription
+Anedya Cloud  (Commands + MQTT broker + TURN relay)
+  │  3. Notify Pi over MQTT command topic ($anedya/device/<id>/commands)
   ▼
 Pi Streamer
-  │  4. Create WebRTC answer + write answer_<sessionId> to ValueStore
+  │  4. Create WebRTC answer + reply via command status ("processing" with ackdata)
   ▼
 Peer App
-  │  5. Poll ValueStore → read answer → apply remote description
+  │  5. Read command status ackdata → decompress answer → apply remote description
   │  6. ICE negotiation completes
   │  7. Media flows (video + audio) — DataChannel for playback controls
 ```
@@ -67,7 +68,9 @@ When a firewall blocks direct peer-to-peer traffic, Anedya's managed TURN relay 
 
 ### Recording and Playback
 
-The Pi records continuously into configurable MP4 segments on disk. The default segment duration is 5 seconds and can be changed with `RECORDING_SEGMENT_SECONDS`. Finalized recordings are kept for 7 days by default; change this with `RECORDING_RETENTION_DAYS`, `RECORDING_RETENTION_HOURS`, or `RECORDING_RETENTION_SECONDS` for short test windows. The viewer receives a timeline over the WebRTC DataChannel and can seek into any finalized segment using the same data channel; the Pi reads and streams the file directly.
+The Pi records continuously into configurable MP4 segments on disk. The default segment duration is 5 seconds and can be changed with `RECORDING_SEGMENT_SECONDS`. Finalized recordings are kept for **1 day by default**; change this with `RECORDING_RETENTION_DAYS`, `RECORDING_RETENTION_HOURS`, or `RECORDING_RETENTION_SECONDS` for short test windows. The viewer receives a timeline over the WebRTC DataChannel and can seek into any finalized segment using the same data channel; the Pi reads and streams the file directly.
+
+If no recording is available at the requested playback position (gap in footage or segment not yet finalized), the viewer shows a "No recording available" placeholder frame until footage resumes.
 
 <p align="center">
     <img src="media/playback.png" alt="TURN relay connection diagram">
@@ -87,13 +90,13 @@ The Pi records continuously into configurable MP4 segments on disk. The default 
 │       ├── main.dart
 │       ├── peer_cam_screen.dart
 │       └── qr_code_scanner.dart
-└── streamer/               — Pi device app (Python)
-    ├── config.py           — credentials, constants, logging
-    ├── recording.py        — rolling MP4 segment writer
-    ├── camera.py           — capture loop, motion detection, timestamp overlay
-    ├── tracks.py           — WebRTC video and audio tracks
-    ├── camera_streamer.py  — MQTT signaling, peer connection handling
-    └── main.py             — CLI entrypoint
+├── config.py               — credentials, constants, logging
+├── recording.py            — rolling MP4 segment writer
+├── camera.py               — capture loop (USB + RTSP), motion detection, timestamp overlay
+├── audio.py                — microphone capture with per-peer fan-out queues
+├── tracks.py               — WebRTC video and audio tracks
+├── camera_streamer.py      — MQTT signaling, peer connection handling
+└── main.py                 — CLI entrypoint
 ```
 
 ---
@@ -104,7 +107,7 @@ The Pi records continuously into configurable MP4 segments on disk. The default 
 
 **Hardware**
 - Raspberry Pi with network access (any model with USB or CSI camera support)
-- USB/UVC webcam (recommended) or CSI camera module
+- USB/UVC webcam, CSI camera module, or an RTSP IP camera
 - Optional: USB microphone for audio
 
 **Software / Accounts**
@@ -151,21 +154,52 @@ cd anedya-camera-livestream-example
 Create the local credentials file from the example:
 
 ```bash
-cp streamer/.env.example streamer/.env
+cp .env.example .env
 ```
 
-Edit `streamer/.env` and fill in your values:
+Edit `.env` and fill in your values:
 
 ```env
+# Camera source
+CAMERA_SOURCE=usb
+CAMERA_SOURCE_URL=          # Required when CAMERA_SOURCE=rtsp
+
+# Anedya credentials
 ANEDYA_DEVICE_ID=your-device-uuid
-ANEDYA_NODE_ID=your-node-uuid
 ANEDYA_CONNECTION_KEY=your-connection-key
 ANEDYA_REGION=ap-in-1
+
+# Recording
 RECORDING_SEGMENT_SECONDS=5
-RECORDING_RETENTION_DAYS=7
+RECORDING_MIN_FREE_MB=512
+RECORDING_RETENTION_DAYS=0
 RECORDING_RETENTION_HOURS=0
-RECORDING_RETENTION_SECONDS=
+RECORDING_RETENTION_SECONDS=3600
+
+# Motion detection (optional)
+MOTION_ANALYSIS_WIDTH=320
+MOTION_ANALYSIS_HEIGHT=240
+MOTION_THRESHOLD_PX=1200
+MOTION_COOLDOWN_SECONDS=5
+MOTION_ROI_TOP_FRACTION=0.5
 ```
+
+**Key configuration variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `CAMERA_SOURCE` | `"usb"` | Camera capture backend: `"usb"` (direct camera) or `"rtsp"` (IP camera) |
+| `CAMERA_SOURCE_URL` | `""` | RTSP stream URL (required when `CAMERA_SOURCE=rtsp`) |
+| `RECORDING_SEGMENT_SECONDS` | `5` | Duration of each MP4 segment in seconds |
+| `RECORDING_MIN_FREE_MB` | `512` | Minimum free disk space required before recording pauses |
+| `RECORDING_RETENTION_DAYS` | `1` | How many days of footage to keep |
+| `RECORDING_RETENTION_HOURS` | `0` | Additional hours (stacks with days) |
+| `RECORDING_RETENTION_SECONDS` | *(computed)* | Override total retention in seconds |
+| `MOTION_ANALYSIS_WIDTH` | `320` | Width of downscaled frame for motion analysis |
+| `MOTION_ANALYSIS_HEIGHT` | `240` | Height of downscaled frame for motion analysis |
+| `MOTION_THRESHOLD_PX` | `1200` | Min contour area (px²) to count as motion |
+| `MOTION_COOLDOWN_SECONDS` | `5` | Seconds between repeated motion log events |
+| `MOTION_ROI_TOP_FRACTION` | `0.5` | Fraction of frame height (from top) excluded from motion analysis — `0.5` analyses lower half only, `0.0` analyses full frame |
 
 Install `uv` if not already present:
 
@@ -176,7 +210,6 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 Install Python dependencies:
 
 ```bash
-cd streamer
 uv sync
 ```
 
@@ -201,10 +234,13 @@ uv run streamer
 **Options:**
 
 ```bash
-uv run streamer --camera 1          # use a different camera device index
-uv run streamer --no-audio          # disable microphone
+uv run streamer --camera 1                     # use a different camera device index
+uv run streamer --no-audio                     # disable microphone
 uv run streamer --record-path /mnt/recordings  # custom recording directory
+uv run streamer --motion-detection             # enable motion detection overlay
 ```
+
+On first start, the streamer prints a QR code in the terminal. Scan it with the mobile app to connect without copy-pasting UUIDs.
 
 ---
 
@@ -250,6 +286,8 @@ In the app,
 
 After the first segment is finalized, a timeline scrubber appears in the viewer. Drag it to seek into recorded footage. The Pi streams frames from the MP4 files directly using the same WebRTC connection by switching the frames it yields; no upload or cloud storage involved.
 
+Gaps in the timeline (e.g. the Pi was offline) show a "No recording available" placeholder frame until the next available segment.
+
 ---
 
 ## 📷 Camera Notes
@@ -273,7 +311,7 @@ This project uses OpenCV `VideoCapture`.
 - [Anedya Concepts](https://docs.anedya.io/essentials/concepts/)
 - [Anedya Project Setup](https://docs.anedya.io/getting-started/project-setup/)
 - [Anedya MQTT Endpoints](https://docs.anedya.io/device/mqtt-endpoints/)
-- [Anedya ValueStore](https://docs.anedya.io/features/valuestore/valuestore-intro/)
+- [Anedya Commands](https://docs.anedya.io/features/commands/commands-intro/)
 - [Anedya Platform API](https://docs.anedya.io/platform-api/)
 
 **WebRTC**
@@ -286,6 +324,7 @@ This project uses OpenCV `VideoCapture`.
 
 ---
 
-## License
+## 📑 Looking for other examples
 
-This project is licensed under the [Apache License 2.0](LICENSE).
+#### @ [Anedya Camera Livestream with ESP32](https://github.com/anedyaio/anedya-camera-livestream-example-esp32)
+
