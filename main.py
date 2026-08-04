@@ -1,61 +1,41 @@
 """
-Pi Cam device process — entrypoint.
+Unified camera streamer — entrypoint.
 
-Parses command-line arguments, validates Anedya credentials, prints a QR code
-for easy peer pairing, then hands control to CameraStreamer which manages
-recording, MQTT signaling, and WebRTC sessions for the lifetime of the process.
+Supports both USB and RTSP camera sources with Anedya Commands signaling.
+Selection is done via environment variables (or .env file):
+
+    CAMERA_SOURCE      "usb" or "rtsp"       (default: usb)
+    CAMERA_SOURCE_URL  RTSP URL              (required when CAMERA_SOURCE=rtsp)
 
 Usage:
-    uv run streamer                        # default camera, audio on
+    uv run streamer                        # USB camera, commands signaling
     uv run streamer --camera 1             # alternate camera device index
     uv run streamer --no-audio             # disable microphone
     uv run streamer --record-path /tmp/rec # custom recording directory
 
-Environment variables (or streamer/.env):
+Environment variables (or unified-streamer/.env):
     ANEDYA_DEVICE_ID       Device UUID from the Anedya console
-    ANEDYA_NODE_ID         Node UUID from the Anedya console
     ANEDYA_CONNECTION_KEY  Device connection key from the Anedya console
     ANEDYA_REGION          API region slug (default: ap-in-1)
-    CAMERA_SOURCE_URL      RTSP URL for IP camera input
 """
 
 import argparse
 import asyncio
-import json
 import logging
 
-import qrcode
-
 from camera_streamer import CameraStreamer
-from config import ANEDYA_DEVICE_ID, ANEDYA_NODE_ID, CAMERA_SOURCE_URL, validate_anedya_config
+from config import (
+    CAMERA_SOURCE,
+    CAMERA_SOURCE_URL,
+    validate_anedya_config,
+)
 
 log = logging.getLogger("streamer")
 
 
-def display_qr_code() -> None:
-    """Print a QR code containing the node and device IDs.
-
-    The peer app scans this to learn which Anedya node to connect to,
-    eliminating the need to manually copy-paste UUIDs.
-    """
-    payload = json.dumps(
-        {
-            "node_id": ANEDYA_NODE_ID,
-            "device_id": ANEDYA_DEVICE_ID,
-        }
-    )
-
-    qr = qrcode.QRCode(border=2)
-    qr.add_data(payload)
-    qr.make(fit=True)
-
-    print("\nScan this QR to connect:\n")
-    qr.print_ascii(invert=True)
-    print("\nPayload:", payload, "\n")
-
-
 async def main(
     camera_index: int,
+    source_mode: str,
     source_url: str,
     enable_audio: bool,
     enable_motion_detection: bool = False,
@@ -64,9 +44,10 @@ async def main(
     """Async entrypoint: run the streamer until interrupted, then shut down cleanly."""
     streamer = CameraStreamer(
         camera_index,
-        source_url,
-        enable_audio,
-        record_path,
+        source_mode=source_mode,
+        source_url=source_url,
+        enable_audio=enable_audio,
+        record_path=record_path,
         enable_motion_detection=enable_motion_detection,
     )
     try:
@@ -80,18 +61,13 @@ async def main(
 def cli() -> None:
     """Synchronous console entrypoint invoked by ``uv run streamer``."""
     parser = argparse.ArgumentParser(
-        description="Pi Cam WebRTC streamer (Anedya MQTT signaling)"
+        description="Unified WebRTC streamer (USB + RTSP, Commands Signaling)"
     )
     parser.add_argument(
         "--camera",
         type=int,
         default=0,
-        help="Local camera device index, used only when --source-url is empty (default: 0)",
-    )
-    parser.add_argument(
-        "--source-url",
-        default=CAMERA_SOURCE_URL,
-        help="RTSP/source URL for IP camera input (default: CAMERA_SOURCE_URL)",
+        help="Camera device index for USB mode (default: 0)",
     )
     parser.add_argument(
         "--no-audio",
@@ -111,20 +87,22 @@ def cli() -> None:
     args = parser.parse_args()
 
     log.info(
-        "Starting streamer (source=%s, camera=%d, audio=%s, motion=%s, record-path=%s)",
-        args.source_url or "local",
+        "Starting streamer (source=%s, signaling=COMMANDS, camera=%d, audio=%s, motion=%s, record-path=%s)",
+        CAMERA_SOURCE.upper(),
         args.camera,
         "off" if args.no_audio else "on",
         "on" if args.motion_detection else "off",
         args.record_path,
     )
     validate_anedya_config()
-    display_qr_code()
+
+    # Run the main async function
     asyncio.run(
         main(
             args.camera,
-            args.source_url,
-            not args.no_audio,
+            source_mode=CAMERA_SOURCE,
+            source_url=CAMERA_SOURCE_URL,
+            enable_audio=not args.no_audio,
             enable_motion_detection=args.motion_detection,
             record_path=args.record_path,
         )

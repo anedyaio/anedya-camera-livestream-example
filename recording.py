@@ -44,12 +44,14 @@ class RecordingManager:
         segment_duration_seconds: int = 60,
         retention_seconds: int = 24 * 60 * 60,
         min_free_mb: int = 512,
+        enable_audio: bool = True,
     ):
         self.record_path = record_path
         self.fps = fps
         self.segment_duration_seconds = segment_duration_seconds
         self.retention_seconds = retention_seconds
         self.min_free_bytes = max(0, int(min_free_mb)) * 1024 * 1024
+        self.enable_audio = enable_audio
 
         self.frame_width: int | None = None
         self.frame_height: int | None = None
@@ -118,7 +120,7 @@ class RecordingManager:
         are acceptable; they create a brief silence in the file rather than
         stalling capture.
         """
-        if not self._is_running or self._audio_queue is None:
+        if not self._is_running or not self.enable_audio or self._audio_queue is None:
             return
         try:
             self._audio_queue.put_nowait(pcm.copy())
@@ -363,7 +365,8 @@ class RecordingManager:
 
             duration = self._read_mp4_duration(path)
             if duration is None or duration <= 0:
-                log.warning("Skipping unreadable recording: %s", path)
+                log.warning("Removing invalid/unreadable recording: %s", path)
+                self._delete_file(path, "invalid recording segment")
                 continue
 
             loaded_segments.append(
@@ -420,8 +423,11 @@ class RecordingManager:
         vstream.time_base = VIDEO_TIME_BASE
         vstream.codec_context.time_base = VIDEO_TIME_BASE
 
-        astream = container.add_stream("aac", rate=AUDIO_SAMPLE_RATE)  # audio track
-        astream.layout = "mono" if AUDIO_CHANNELS == 1 else "stereo"
+        if self.enable_audio:
+            astream = container.add_stream("aac", rate=AUDIO_SAMPLE_RATE)  # audio track
+            astream.layout = "mono" if AUDIO_CHANNELS == 1 else "stereo"
+        else:
+            astream = None
 
         self._av_container = container
         self._av_video_stream = vstream
