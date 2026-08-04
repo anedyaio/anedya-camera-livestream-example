@@ -9,7 +9,7 @@ dependencies = [
     "imageio-ffmpeg>=0.6.0; platform_system == 'Windows'",
     "linuxpy>=0.24.0; platform_system == 'Linux'",
     "numpy",
-    "opencv-python",
+    "opencv-python-headless>=5.0.0.93",
     "paho-mqtt",
     "sounddevice",
     "zstandard",
