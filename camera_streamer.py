@@ -205,6 +205,7 @@ class CameraStreamer:
             segment_duration_seconds=RECORDING_SEGMENT_SECONDS,
             retention_seconds=RECORDING_RETENTION_SECONDS,
             min_free_mb=RECORDING_MIN_FREE_MB,
+            enable_audio=enable_audio,
         )
         self.source: CameraSource | None = None  # Camera source
         self.audio_source: MicrophoneSource | None = None  # Audio source
@@ -618,6 +619,17 @@ class CameraStreamer:
         log.info("Waiting for MQTT connection before starting subsystems...")
         await self._mqtt_connected_event.wait()
 
+        # Create and start audio source if enabled (before recorder starts)
+        if self.enable_audio:
+            try:
+                self.audio_source = MicrophoneSource(recorder=self.recorder)
+                self.audio_source.start()
+            except Exception as exc:
+                self.enable_audio = False
+                self.audio_source = None
+                self.recorder.enable_audio = False
+                log.warning("Audio disabled (microphone device unavailable or not connected): %s", exc)
+
         # Recorder must be running before the camera source starts so that
         # the very first frames are not dropped while the queue is being created.
         self._recorder_task = asyncio.create_task(self.recorder.run())
@@ -638,16 +650,6 @@ class CameraStreamer:
             motion_roi_top_fraction=MOTION_ROI_TOP_FRACTION,
         )
         await source.start()
-
-        # Create and start audio source if enabled
-        if self.enable_audio:
-            try:
-                self.audio_source = MicrophoneSource(recorder=self.recorder)
-                self.audio_source.start()
-            except Exception as exc:
-                self.enable_audio = False
-                self.audio_source = None
-                log.warning("Audio disabled: %s", exc)
 
         self.source = source
         log.info(

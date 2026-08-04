@@ -58,15 +58,20 @@ class MicrophoneSource:
                 "`sudo apt install libportaudio2`, or run with `--no-audio`."
             ) from exc
 
-        self._input_stream = sd.InputStream(
-            samplerate=AUDIO_SAMPLE_RATE,
-            channels=AUDIO_CHANNELS,
-            dtype="int16",
-            blocksize=AUDIO_FRAME_SAMPLES,  # exactly one 20ms WebRTC frame per callback
-            callback=self._sounddevice_callback,
-        )
-        self._input_stream.start()
-        log.info("Microphone opened (%d Hz, %d ch)", AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
+        try:
+            self._input_stream = sd.InputStream(
+                samplerate=AUDIO_SAMPLE_RATE,
+                channels=AUDIO_CHANNELS,
+                dtype="int16",
+                blocksize=AUDIO_FRAME_SAMPLES,  # exactly one 20ms WebRTC frame per callback
+                callback=self._sounddevice_callback,
+            )
+            self._input_stream.start()
+            log.info("Microphone opened (%d Hz, %d ch)", AUDIO_SAMPLE_RATE, AUDIO_CHANNELS)
+        except Exception as exc:
+            raise RuntimeError(
+                f"No default audio input device (microphone) found on host: {exc}"
+            ) from exc
 
     def subscribe(self) -> tuple[int, asyncio.Queue[np.ndarray]]:
         """Create a bounded audio queue for one peer."""
