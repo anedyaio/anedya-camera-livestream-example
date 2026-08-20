@@ -576,6 +576,7 @@ class CameraSource:
         """Start the background capture loop."""
         if self._capture_task is None:
             self._is_running = True
+            self._last_frame_monotonic = time.monotonic()
             self._capture_task = asyncio.create_task(self._capture_loop())
             self._capture_task.add_done_callback(self._on_capture_done)
             log.info("Camera capture task started [%s]", self.source_mode.upper())
@@ -702,36 +703,87 @@ class CameraSource:
             return None
         return frame
 
+    async def _reopen_camera(self) -> bool:
+        """Safely close existing camera handles and attempt to re-initialize capture."""
+        log.info("Attempting to reconnect camera source [%s]...", self.source_mode.upper())
+
+        def _close_handles():
+            if self._cv_cap is not None:
+                try:
+                    self._cv_cap.release()
+                except Exception as exc:
+                    log.debug("Error releasing cv_cap: %s", exc)
+                self._cv_cap = None
+            if self._av_container is not None:
+                try:
+                    self._av_container.close()
+                except Exception as exc:
+                    log.debug("Error closing av_container: %s", exc)
+                self._av_container = None
+                self._av_decoder = None
+
+        await asyncio.to_thread(_close_handles)
+
+        try:
+            if self.source_mode == "rtsp":
+                await asyncio.to_thread(self._init_rtsp_capture)
+            else:
+                await asyncio.to_thread(self._init_usb_capture)
+            self._last_frame_monotonic = time.monotonic()
+            self._last_capture_stall_log = 0.0
+            log.info("Camera source successfully reconnected [%s]", self.source_mode.upper())
+            return True
+        except Exception as exc:
+            log.warning(
+                "Camera reconnect failed [%s]: %s (will retry in 5s)",
+                self.source_mode.upper(),
+                exc,
+            )
+            return False
+
     # ── Capture loop (dispatches to the right reader) ─────────────
 
     async def _capture_loop(self) -> None:
         """Main capture loop: read → analyse → annotate → record → publish."""
         frame_interval = 1 / self.fps if self.fps > 0 else 0
-
-        # Pick the right frame reader based on source mode
-        if self.source_mode == "rtsp":
-            read_frame = self._read_opencv_frame
-        else:
-            read_frame = self._read_pyav_frame
+        consecutive_none_count = 0
+        STALL_NONE_THRESHOLD = 30  # ~1.5s - 3s of consecutive empty reads
 
         while self._is_running:
             loop_start = time.monotonic()
+
+            if self.source_mode == "rtsp":
+                read_frame = self._read_opencv_frame
+            else:
+                read_frame = self._read_pyav_frame
+
             raw_frame = await asyncio.to_thread(read_frame)
             if raw_frame is None:
+                consecutive_none_count += 1
                 now_monotonic = time.monotonic()
                 seconds_without_frames = now_monotonic - self._last_frame_monotonic
                 if (
                     seconds_without_frames >= 5.0
-                    and now_monotonic - self._last_capture_stall_log >= 30.0
+                    and now_monotonic - self._last_capture_stall_log >= 10.0
                 ):
                     log.warning(
-                        "Camera capture has produced no frames for %.1fs",
+                        "Camera capture stalled (no frames for %.1fs, %d consecutive empty reads). Triggering reconnect...",
                         seconds_without_frames,
+                        consecutive_none_count,
                     )
                     self._last_capture_stall_log = now_monotonic
-                await asyncio.sleep(0.05)
+
+                if seconds_without_frames >= 5.0 or consecutive_none_count >= STALL_NONE_THRESHOLD:
+                    reconnected = await self._reopen_camera()
+                    if reconnected:
+                        consecutive_none_count = 0
+                    else:
+                        await asyncio.sleep(5.0)
+                else:
+                    await asyncio.sleep(0.05)
                 continue
 
+            consecutive_none_count = 0
             self._last_frame_monotonic = time.monotonic()
             self._update_measured_fps()
 
@@ -752,7 +804,6 @@ class CameraSource:
 
             elapsed = time.monotonic() - loop_start
             sleep_time = max(0.0, frame_interval - elapsed)
-            # await asyncio.sleep(sleep_time)  # pace to target FPS
 
     async def get_next_frame(
         self, last_known_sequence: int
